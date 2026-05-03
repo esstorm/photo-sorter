@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -7,10 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import rawpy
 from PIL import Image, ImageFilter, ExifTags
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -33,6 +35,8 @@ RAW_EXTENSIONS = {
     ".x3f",                   # Sigma
 }
 
+ALL_PHOTO_EXTENSIONS = IMAGE_EXTENSIONS | RAW_EXTENSIONS
+
 BLUR_THRESHOLD = 500.0
 SIMILARITY_THRESHOLD = 10
 
@@ -40,8 +44,9 @@ SIMILARITY_THRESHOLD = 10
 CONFIG_DIR = Path.home() / ".config" / "photo_sorter"
 DB_PATH = CONFIG_DIR / "photos.db"
 
-# In-memory analysis cache keyed by absolute path
+# In-memory caches keyed by absolute path
 analysis_cache: dict = {}
+raw_preview_cache: dict[str, bytes] = {}  # RAW path -> JPEG bytes
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -134,6 +139,33 @@ def require_valid_folder(folder: str) -> str:
 
 # ── Image analysis ────────────────────────────────────────────────────────────
 
+def is_raw(path: str) -> bool:
+    return Path(path).suffix.lower() in RAW_EXTENSIONS
+
+
+def open_as_pil(path: str) -> Image.Image:
+    """Open any photo (including RAW) as a PIL Image using the embedded JPEG thumbnail."""
+    if is_raw(path):
+        with rawpy.imread(path) as raw:
+            thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                return Image.open(io.BytesIO(thumb.data)).copy()
+            # Fallback: render full postprocessed image (slower)
+            rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)
+            return Image.fromarray(rgb)
+    return Image.open(path)
+
+
+def raw_preview_jpeg(path: str) -> bytes:
+    """Return cached JPEG bytes for a RAW file (for browser display)."""
+    if path not in raw_preview_cache:
+        img = open_as_pil(path)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=88)
+        raw_preview_cache[path] = buf.getvalue()
+    return raw_preview_cache[path]
+
+
 def find_raw_companion(path: str) -> str:
     p = Path(path)
     for ext in RAW_EXTENSIONS:
@@ -145,7 +177,7 @@ def find_raw_companion(path: str) -> str:
 
 def compute_dhash(path: str) -> str:
     try:
-        img = Image.open(path).convert("L").resize((9, 8), Image.LANCZOS)
+        img = open_as_pil(path).convert("L").resize((9, 8), Image.LANCZOS)
         arr = np.array(img)
         diff = arr[:, 1:] > arr[:, :-1]
         val = 0
@@ -175,7 +207,7 @@ def hamming(h1: str, h2: str) -> int:
 
 def compute_blur_score(path: str) -> float:
     try:
-        img = Image.open(path)
+        img = open_as_pil(path)
         img.thumbnail((512, 512), Image.LANCZOS)
         edges = img.convert("L").filter(ImageFilter.FIND_EDGES)
         return float(np.array(edges, dtype=np.float64).var())
@@ -185,12 +217,14 @@ def compute_blur_score(path: str) -> float:
 
 def get_exif(path: str) -> dict:
     try:
-        raw = Image.open(path).getexif()
-        if not raw:
+        # For RAW files, read EXIF from the embedded thumbnail PIL image
+        img = open_as_pil(path) if is_raw(path) else Image.open(path)
+        raw_exif = img.getexif()
+        if not raw_exif:
             return {}
         wanted = {"Make", "Model", "DateTime", "DateTimeOriginal"}
         result = {}
-        for tag_id, val in raw.items():
+        for tag_id, val in raw_exif.items():
             tag = ExifTags.TAGS.get(tag_id, "")
             if tag in wanted:
                 if isinstance(val, bytes):
@@ -214,8 +248,8 @@ def analyze(path: str, folder: str) -> dict:
     raw_companion = find_raw_companion(path)
 
     try:
-        with Image.open(path) as img:
-            w, h = img.size
+        img = open_as_pil(path)
+        w, h = img.size
     except Exception:
         w, h = 0, 0
 
@@ -293,9 +327,14 @@ def cluster_by_dhash(rows: list) -> list:
 
 
 def scan_photos(folder: str) -> list:
+    all_files = [f for f in Path(folder).iterdir()
+                 if f.is_file() and f.suffix.lower() in ALL_PHOTO_EXTENSIONS]
+    # Stems covered by a JPEG/standard image — RAW files with these stems are companions, not primary
+    jpeg_stems = {f.stem.upper() for f in all_files if f.suffix.lower() in IMAGE_EXTENSIONS}
     return sorted(
-        str(f) for f in Path(folder).iterdir()
-        if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+        str(f) for f in all_files
+        if f.suffix.lower() in IMAGE_EXTENSIONS
+        or f.stem.upper() not in jpeg_stems  # RAW only included when no JPEG companion exists
     )
 
 
@@ -412,6 +451,9 @@ def get_image(path: str, folder: str):
     validate_path(path, folder)
     if not os.path.isfile(path):
         raise HTTPException(404, "Not found")
+    if is_raw(path):
+        jpeg_bytes = raw_preview_jpeg(path)
+        return StreamingResponse(io.BytesIO(jpeg_bytes), media_type="image/jpeg")
     return FileResponse(path)
 
 
