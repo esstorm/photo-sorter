@@ -216,7 +216,8 @@
     <div class="flex flex-1 min-h-0">
 
       <!-- Image area -->
-      <div class="relative flex-1 flex items-center justify-center bg-slate-950 vignette min-w-0">
+      <div class="relative flex-1 flex items-center justify-center bg-slate-950 vignette min-w-0 overflow-hidden"
+           @wheel.prevent="handleGesture($event)">
 
         <!-- Action flash -->
         <div x-show="flashAction" class="absolute inset-0 pointer-events-none z-20 flex items-center justify-center"
@@ -240,8 +241,19 @@
 
         <template x-if="currentPhoto">
           <img :src="`/api/image?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}`"
-               :key="currentPhoto.path" class="max-h-full max-w-full object-contain img-fade"
-               style="max-height:calc(100vh - 148px)" draggable="false" />
+               :key="currentPhoto.path"
+               class="max-h-full max-w-full object-contain img-fade select-none"
+               :class="zoom > 1 ? (_isPanning ? 'cursor-grabbing' : 'cursor-grab') : ''"
+               :style="`max-height:calc(100vh - 148px);
+                        transform: translate(${panX}px, ${panY}px) scale(${zoom});
+                        transform-origin: center;
+                        transition: ${_isPanning ? 'none' : 'transform 0.12s ease'}`"
+               @pointerdown="startPan($event)"
+               @pointermove="doPan($event)"
+               @pointerup="endPan()"
+               @pointerleave="endPan()"
+               @dblclick="resetZoom()"
+               draggable="false" />
         </template>
         <div x-show="loadingPhoto && !currentPhoto" class="text-slate-600 text-sm animate-pulse">Loading…</div>
       </div>
@@ -623,6 +635,14 @@
       browserDirs: [],
       browserLoading: false,
 
+      zoom: 1,
+      panX: 0,
+      panY: 0,
+      _swipeAccum: 0,
+      _swipeTimer: null,
+      _isPanning: false,
+      _panStart: null,
+
       // ── Init (URL routing) ────────────────────────────────────────
       async init() {
         const folder = new URLSearchParams(window.location.search).get('folder');
@@ -694,6 +714,7 @@
       async goToPath(path) {
         if (!path) return;
         this.currentPath = path;
+        this.zoom = 1; this.panX = 0; this.panY = 0;
         await this.loadPhotoData(path);
       },
 
@@ -884,6 +905,52 @@
           this.executing = false;
         }
       },
+
+      // ── Gestures (trackpad swipe + pinch zoom) ────────────────────
+      handleGesture(e) {
+        if (this.screen !== 'sorting' || !this.currentPhoto) return;
+
+        if (e.ctrlKey) {
+          // Trackpad pinch → zoom (macOS sends wheel+ctrlKey for pinch)
+          e.preventDefault();
+          const factor = 1 - e.deltaY * 0.008;
+          this.zoom = Math.max(1, Math.min(6, this.zoom * factor));
+          if (this.zoom === 1) { this.panX = 0; this.panY = 0; }
+          return;
+        }
+
+        const dx = Math.abs(e.deltaX), dy = Math.abs(e.deltaY);
+        if (dx <= dy) return; // vertical — let sidebar scroll normally
+        e.preventDefault();
+
+        this._swipeAccum += e.deltaX;
+        clearTimeout(this._swipeTimer);
+        this._swipeTimer = setTimeout(() => { this._swipeAccum = 0; }, 400);
+
+        if (Math.abs(this._swipeAccum) > 60) {
+          const dir = this._swipeAccum > 0 ? 1 : -1;
+          this._swipeAccum = 0;
+          this.navigate(dir);
+        }
+      },
+
+      startPan(e) {
+        if (this.zoom <= 1) return;
+        e.preventDefault();
+        this._isPanning = true;
+        this._panStart = { x: e.clientX - this.panX, y: e.clientY - this.panY };
+        e.currentTarget.setPointerCapture(e.pointerId);
+      },
+
+      doPan(e) {
+        if (!this._isPanning) return;
+        this.panX = e.clientX - this._panStart.x;
+        this.panY = e.clientY - this._panStart.y;
+      },
+
+      endPan() { this._isPanning = false; },
+
+      resetZoom() { this.zoom = 1; this.panX = 0; this.panY = 0; },
 
       // ── Keyboard ──────────────────────────────────────────────────
       handleKey(e) {
