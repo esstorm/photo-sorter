@@ -293,6 +293,18 @@
               </div>
             </template>
 
+            <!-- RAW companion -->
+            <template x-if="currentPhoto.raw_companion">
+              <div class="bg-orange-950/40 border border-orange-800/40 rounded-xl p-3">
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="bg-orange-700/60 text-orange-200 text-xs font-bold px-1.5 py-0.5 rounded font-mono">RAW</span>
+                  <p class="text-orange-200 text-xs font-semibold">Companion file</p>
+                </div>
+                <p class="text-orange-300/70 font-mono text-xs break-all" x-text="currentPhoto.raw_name"></p>
+                <p class="text-orange-400/50 text-xs mt-1.5 leading-snug">This RAW file will be moved to trash together with the JPEG when deleted.</p>
+              </div>
+            </template>
+
             <!-- Similar photos strip -->
             <template x-if="getSimilar().length > 0">
               <div>
@@ -470,9 +482,14 @@
             </template>
           </div>
           <div class="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 mb-5 text-sm text-slate-400 leading-relaxed">
-            These <strong class="text-white" x-text="countAction('delete')"></strong> photos will be moved to
-            <code class="bg-slate-900 text-slate-300 px-1.5 py-0.5 rounded font-mono text-xs">_trash/</code>
-            inside your folder. <strong class="text-white">Not permanently deleted.</strong>
+            <span class="text-white font-semibold" x-text="countAction('delete')"></span> photos
+            <template x-if="rawDeleteCount() > 0">
+              <span> + <span class="text-orange-300 font-semibold" x-text="rawDeleteCount()"></span>
+              <span class="text-orange-300/70"> RAW companion<span x-show="rawDeleteCount() !== 1">s</span></span></span>
+            </template>
+            will be moved to
+            <code class="bg-slate-900 text-slate-300 px-1.5 py-0.5 rounded font-mono text-xs">_trash/</code>.
+            <strong class="text-white">Not permanently deleted.</strong>
           </div>
           <button @click="executeDelete" :disabled="executing"
                   class="bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white font-semibold px-6 py-3 rounded-xl transition-colors">
@@ -495,7 +512,13 @@
       <h2 class="text-xl font-bold text-white mb-1">Done!</h2>
       <template x-if="deleteResults">
         <div class="space-y-2 text-sm text-slate-400 mt-3">
-          <p><span class="text-white font-semibold" x-text="deleteResults.moved.length"></span> photo<span x-show="deleteResults.moved.length !== 1">s</span> moved to trash</p>
+          <p>
+            <span class="text-white font-semibold" x-text="deleteResults.moved.length"></span>
+            photo<span x-show="deleteResults.moved.length !== 1">s</span> moved to trash
+            <template x-if="deleteResults.raw_moved && deleteResults.raw_moved.length > 0">
+              <span class="text-orange-300/80"> + <span x-text="deleteResults.raw_moved.length"></span> RAW file<span x-show="deleteResults.raw_moved.length !== 1">s</span></span>
+            </template>
+          </p>
           <p class="font-mono text-xs text-slate-600 break-all" x-text="deleteResults.trash"></p>
         </div>
       </template>
@@ -561,6 +584,7 @@
 
       photos: [],
       classifications: {},
+      companions: {},      // photo_path -> raw_companion_path (populated on folder open)
       currentPhoto: null,
       currentPath: '',
       loadingPhoto: false,
@@ -620,6 +644,7 @@
           this.currentFolder = folder;
           this.photos = data.photos;
           this.classifications = data.classifications || {};
+          this.companions = data.companions || {};
           this.activeFilter = null;
           this.groups = [];
           this.groupMap = {};
@@ -770,6 +795,10 @@
 
       getDeletePhotos() {
         return Object.entries(this.classifications).filter(([, a]) => a === 'delete').map(([p]) => p);
+      },
+
+      rawDeleteCount() {
+        return this.getDeletePhotos().filter(p => this.companions[p]).length;
       },
 
       // ── Groups ────────────────────────────────────────────────────

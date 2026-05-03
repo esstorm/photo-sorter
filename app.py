@@ -18,6 +18,22 @@ import uvicorn
 app = FastAPI()
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp", ".bmp"}
+
+# RAW formats paired with viewable images (same stem, different extension)
+RAW_EXTENSIONS = {
+    ".cr2", ".cr3",           # Canon
+    ".nef", ".nrw",           # Nikon
+    ".arw", ".srf", ".sr2",   # Sony
+    ".raf",                   # Fujifilm
+    ".orf",                   # Olympus / OM System
+    ".rw2",                   # Panasonic
+    ".pef", ".ptx",           # Pentax
+    ".dng",                   # Adobe DNG (Leica, Ricoh, phones…)
+    ".rwl",                   # Leica legacy
+    ".3fr",                   # Hasselblad
+    ".iiq",                   # Phase One
+    ".x3f",                   # Sigma
+}
 BLUR_THRESHOLD = 500.0
 SIMILARITY_THRESHOLD = 10
 
@@ -77,10 +93,16 @@ def init_db(folder: str) -> None:
             dhash           TEXT,
             exif_json       TEXT,
             classification  TEXT,
-            classified_at   TEXT
+            classified_at   TEXT,
+            raw_companion   TEXT
         );
     """)
-    conn.commit()
+    # Migration: add column for databases created before RAW support
+    try:
+        conn.execute("ALTER TABLE photos ADD COLUMN raw_companion TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.close()
 
 
@@ -179,6 +201,16 @@ def get_exif(path: str) -> dict:
         return {}
 
 
+def find_raw_companion(path: str) -> str:
+    """Return the path of a RAW sidecar with the same stem, or empty string."""
+    p = Path(path)
+    for ext in RAW_EXTENSIONS:
+        for candidate in (p.with_suffix(ext), p.with_suffix(ext.upper())):
+            if candidate.exists() and candidate.resolve() != p.resolve():
+                return str(candidate)
+    return ""
+
+
 def analyze(path: str, folder: str) -> dict:
     if path in analysis_cache:
         return analysis_cache[path]
@@ -196,6 +228,8 @@ def analyze(path: str, folder: str) -> dict:
     except Exception:
         w, h = 0, 0
 
+    raw_companion = find_raw_companion(path)
+
     result = {
         "path": path,
         "name": f.name,
@@ -207,6 +241,8 @@ def analyze(path: str, folder: str) -> dict:
         "file_hash": file_hash,
         "dhash": dhash,
         "exif": exif,
+        "raw_companion": raw_companion,
+        "raw_name": Path(raw_companion).name if raw_companion else "",
     }
     analysis_cache[path] = result
 
@@ -215,17 +251,17 @@ def analyze(path: str, folder: str) -> dict:
             """
             INSERT INTO photos
                 (path, name, size_mb, width, height, blur_score,
-                 suggest_delete, file_hash, dhash, exif_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+                 suggest_delete, file_hash, dhash, exif_json, raw_companion)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
                 size_mb=excluded.size_mb, width=excluded.width,
                 height=excluded.height, blur_score=excluded.blur_score,
                 suggest_delete=excluded.suggest_delete,
                 file_hash=excluded.file_hash, dhash=excluded.dhash,
-                exif_json=excluded.exif_json
+                exif_json=excluded.exif_json, raw_companion=excluded.raw_companion
             """,
             (path, f.name, result["size_mb"], w, h, round(score, 1),
-             int(result["suggest_delete"]), file_hash, dhash, json.dumps(exif)),
+             int(result["suggest_delete"]), file_hash, dhash, json.dumps(exif), raw_companion),
         )
     return result
 
@@ -284,6 +320,23 @@ def open_folder(path: str):
 
     photos = scan_photos(folder)
 
+    # Eagerly find RAW companions for every photo (fast — just path checks, no image decode)
+    companions: dict = {}
+    for photo_path in photos:
+        raw = find_raw_companion(photo_path)
+        if raw:
+            companions[photo_path] = raw
+
+    # Persist companions to DB (upsert only those found, don't overwrite existing full analysis)
+    if companions:
+        with get_db(folder) as conn:
+            for photo_path, raw_path in companions.items():
+                conn.execute(
+                    "INSERT INTO photos (path, name, raw_companion) VALUES (?,?,?) "
+                    "ON CONFLICT(path) DO UPDATE SET raw_companion=excluded.raw_companion",
+                    (photo_path, Path(photo_path).name, raw_path),
+                )
+
     classifications = {}
     if photos:
         placeholders = ",".join("?" * len(photos))
@@ -297,7 +350,13 @@ def open_folder(path: str):
     stats = db_stats(folder)
     registry_upsert(folder, len(photos), stats)
 
-    return {"photos": photos, "count": len(photos), "classifications": classifications, "stats": stats}
+    return {
+        "photos": photos,
+        "count": len(photos),
+        "classifications": classifications,
+        "companions": companions,
+        "stats": stats,
+    }
 
 
 @app.get("/api/analyze")
@@ -384,35 +443,57 @@ def get_groups(folder: str):
     }
 
 
+def _move_to_trash(src: Path, trash: Path) -> str | None:
+    """Move src into trash, avoiding collisions. Returns destination name or None on error."""
+    dst = trash / src.name
+    counter = 1
+    while dst.exists():
+        dst = trash / f"{src.stem}_{counter}{src.suffix}"
+        counter += 1
+    try:
+        shutil.move(str(src), str(dst))
+        return src.name
+    except Exception:
+        return None
+
+
 @app.post("/api/execute")
 def execute(req: ExecuteReq):
     folder = require_valid_folder(req.folder)
     with get_db(folder) as conn:
         rows = conn.execute(
-            "SELECT path FROM photos WHERE classification='delete'"
+            "SELECT path, raw_companion FROM photos WHERE classification='delete'"
         ).fetchall()
 
     trash = Path(folder) / "_trash"
     trash.mkdir(exist_ok=True)
-    moved, errors = [], []
+    moved, raw_moved, errors = [], [], []
 
     for row in rows:
         src = Path(row["path"])
         if not src.exists():
             continue
-        dst = trash / src.name
-        counter = 1
-        while dst.exists():
-            dst = trash / f"{src.stem}_{counter}{src.suffix}"
-            counter += 1
-        try:
-            shutil.move(str(src), str(dst))
-            moved.append(src.name)
-        except Exception as e:
-            errors.append({"name": src.name, "error": str(e)})
+
+        name = _move_to_trash(src, trash)
+        if name:
+            moved.append(name)
+        else:
+            errors.append({"name": src.name, "error": "could not move"})
+            continue  # skip companion if main file failed
+
+        # Move RAW companion — prefer DB value, fall back to live filesystem check
+        raw_path = row["raw_companion"] or find_raw_companion(str(src))
+        if raw_path:
+            raw_src = Path(raw_path)
+            if raw_src.exists():
+                raw_name = _move_to_trash(raw_src, trash)
+                if raw_name:
+                    raw_moved.append(raw_name)
+                else:
+                    errors.append({"name": raw_src.name, "error": "could not move RAW"})
 
     registry_upsert(folder, len(scan_photos(folder)), db_stats(folder))
-    return {"moved": moved, "errors": errors, "trash": str(trash)}
+    return {"moved": moved, "raw_moved": raw_moved, "errors": errors, "trash": str(trash)}
 
 
 @app.get("/api/browse")
