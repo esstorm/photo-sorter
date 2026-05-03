@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Per-folder databases created at runtime — not part of the project
+*/_photo_sorter.db
+_photo_sorter.db
+_trash/

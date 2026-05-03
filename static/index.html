@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-950">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Photo Sorter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .img-fade { transition: opacity 0.1s ease; }
+    .vignette::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,0.4) 100%);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 h-full" x-data="app()" x-cloak @keydown.window="handleKey($event)">
+
+  <!-- ══════════════════════════════════════════════════════════ SETUP -->
+  <div x-show="screen === 'setup'" class="min-h-screen flex items-center justify-center p-4">
+    <div class="bg-slate-800/80 backdrop-blur border border-slate-700/60 rounded-2xl p-8 w-full max-w-md shadow-2xl">
+
+      <div class="mb-6">
+        <h1 class="text-2xl font-bold text-white tracking-tight">Photo Sorter</h1>
+        <p class="text-slate-400 text-sm mt-1">Keyboard-first photo triage. Classifications are saved and restored per folder.</p>
+      </div>
+
+      <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Folder path</label>
+      <div class="flex gap-2 mb-2">
+        <input
+          type="text"
+          x-model="folderPath"
+          @keydown.enter="submitFolder"
+          placeholder="/Users/you/Photos/2024-vacation"
+          class="flex-1 min-w-0 bg-slate-900 border border-slate-600 rounded-xl px-4 py-3 text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition font-mono text-sm"
+        />
+        <button
+          @click="openBrowser()"
+          class="flex-shrink-0 bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-3 rounded-xl transition-colors text-sm font-medium"
+        >Browse…</button>
+      </div>
+      <p x-show="folderError" x-text="folderError" class="text-red-400 text-sm mb-3"></p>
+      <button
+        @click="submitFolder"
+        class="w-full bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-colors mt-1"
+      >Open Folder →</button>
+
+      <div class="mt-6 pt-5 border-t border-slate-700 grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs text-slate-500">
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">K</kbd> Keep</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">F</kbd> Favorite</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">D</kbd> Delete</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">U</kbd> Unsure</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">G</kbd> Groups</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">Z</kbd> Undo</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════ LOADING -->
+  <div x-show="screen === 'loading'" class="min-h-screen flex items-center justify-center">
+    <div class="text-center space-y-4">
+      <div class="w-10 h-10 border-[3px] border-blue-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+      <p class="text-slate-400 text-sm">Scanning folder…</p>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════ SORTING -->
+  <div x-show="screen === 'sorting'" class="h-screen flex flex-col overflow-hidden">
+
+    <!-- Top bar -->
+    <div class="flex items-center justify-between px-5 py-2.5 bg-slate-900 border-b border-slate-800 flex-shrink-0">
+      <div class="flex items-center gap-3">
+        <span class="text-slate-400 text-sm font-mono tabular-nums">
+          <span x-text="current + 1"></span><span class="text-slate-600">/</span><span x-text="photos.length"></span>
+        </span>
+        <div class="w-36 bg-slate-700 rounded-full h-1.5">
+          <div class="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
+               :style="`width: ${Math.min((current + 1) / photos.length * 100, 100)}%`"></div>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-4 text-xs font-medium">
+        <span class="text-amber-400 flex items-center gap-1">
+          <span class="w-1.5 h-1.5 bg-amber-400 rounded-full"></span>
+          <span x-text="countAction('favorite')"></span> fav
+        </span>
+        <span class="text-green-400 flex items-center gap-1">
+          <span class="w-1.5 h-1.5 bg-green-400 rounded-full"></span>
+          <span x-text="countAction('keep')"></span> keep
+        </span>
+        <span class="text-red-400 flex items-center gap-1">
+          <span class="w-1.5 h-1.5 bg-red-400 rounded-full"></span>
+          <span x-text="countAction('delete')"></span> delete
+        </span>
+        <span class="text-yellow-400 flex items-center gap-1">
+          <span class="w-1.5 h-1.5 bg-yellow-400 rounded-full"></span>
+          <span x-text="countAction('unsure')"></span> unsure
+        </span>
+        <span class="text-slate-600 flex items-center gap-1">
+          <span class="w-1.5 h-1.5 bg-slate-600 rounded-full"></span>
+          <span x-text="photos.length - Object.keys(classifications).length"></span> left
+        </span>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <button @click="showGroups" class="text-sm bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg transition-colors text-slate-200 flex items-center gap-1.5">
+          <span x-show="groupsLoading" class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></span>
+          <span x-show="!groupsLoading && groups.length > 0" class="text-violet-400 font-semibold" x-text="groups.length"></span>
+          Groups
+        </button>
+        <button @click="openReview" class="text-sm bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg transition-colors text-slate-200">
+          Review &amp; Finish →
+        </button>
+      </div>
+    </div>
+
+    <!-- Main body -->
+    <div class="flex flex-1 min-h-0">
+
+      <!-- Image area -->
+      <div class="relative flex-1 flex items-center justify-center bg-slate-950 vignette min-w-0">
+
+        <!-- Action flash -->
+        <div
+          x-show="flashAction"
+          class="absolute inset-0 pointer-events-none z-20 flex items-center justify-center"
+          :class="{
+            'bg-green-500/10':  flashAction === 'keep',
+            'bg-red-500/10':    flashAction === 'delete',
+            'bg-amber-500/10':  flashAction === 'favorite',
+            'bg-yellow-500/10': flashAction === 'unsure',
+          }"
+        >
+          <span
+            class="text-6xl font-black tracking-tighter drop-shadow-2xl"
+            :class="{
+              'text-green-400':  flashAction === 'keep',
+              'text-red-400':    flashAction === 'delete',
+              'text-amber-400':  flashAction === 'favorite',
+              'text-yellow-400': flashAction === 'unsure',
+            }"
+            x-text="{ keep: '♥ KEEP', delete: '✕ DELETE', favorite: '★ FAVORITE', unsure: '? UNSURE' }[flashAction]"
+          ></span>
+        </div>
+
+        <!-- Classification badge -->
+        <div
+          x-show="currentPhoto && classifications[currentPhoto.path]"
+          class="absolute top-3 left-3 z-10 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider"
+          :class="actionBadgeClass(classifications[currentPhoto?.path])"
+          x-text="classifications[currentPhoto?.path]"
+        ></div>
+
+        <template x-if="currentPhoto">
+          <img
+            :src="`/api/image?path=${encodeURIComponent(currentPhoto.path)}`"
+            :key="currentPhoto.path"
+            class="max-h-full max-w-full object-contain img-fade"
+            style="max-height: calc(100vh - 108px)"
+            draggable="false"
+          />
+        </template>
+        <div x-show="loadingPhoto && !currentPhoto" class="text-slate-600 text-sm animate-pulse">Loading…</div>
+      </div>
+
+      <!-- Sidebar -->
+      <div class="w-72 bg-slate-900 border-l border-slate-800 overflow-y-auto flex-shrink-0 p-5 space-y-5">
+
+        <template x-if="currentPhoto">
+          <div class="space-y-5">
+
+            <!-- Filename -->
+            <div>
+              <p class="label">File</p>
+              <p class="text-sm text-white font-mono break-all leading-snug" x-text="currentPhoto.name"></p>
+            </div>
+
+            <!-- Sharpness -->
+            <div>
+              <div class="flex items-center justify-between mb-1.5">
+                <p class="label">Sharpness</p>
+                <span class="text-xs font-mono font-semibold" :class="blurScoreColor(currentPhoto.blur_score)"
+                      x-text="currentPhoto.blur_score < 0 ? 'N/A' : currentPhoto.blur_score"></span>
+              </div>
+              <div class="bg-slate-800 rounded-full h-2 overflow-hidden">
+                <div class="h-2 rounded-full transition-all duration-500"
+                     :class="blurBarClass(currentPhoto.blur_score)"
+                     :style="`width: ${blurBarWidth(currentPhoto.blur_score)}%`"></div>
+              </div>
+              <p class="text-xs mt-1.5 font-medium" :class="blurScoreColor(currentPhoto.blur_score)"
+                 x-text="blurLabel(currentPhoto.blur_score)"></p>
+            </div>
+
+            <!-- Suggest-delete banner -->
+            <div x-show="currentPhoto.suggest_delete"
+                 class="flex items-start gap-2 bg-red-950/60 border border-red-800/50 rounded-xl p-3">
+              <span class="text-red-400 mt-0.5 flex-shrink-0">⚠</span>
+              <div>
+                <p class="text-red-300 text-xs font-semibold">Suggested: Delete</p>
+                <p class="text-red-400/60 text-xs mt-0.5 leading-snug">Low sharpness — likely blurry.</p>
+              </div>
+            </div>
+
+            <!-- Dimensions & size -->
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <p class="label">Size</p>
+                <p class="text-sm text-slate-300" x-text="`${currentPhoto.size_mb} MB`"></p>
+              </div>
+              <div>
+                <p class="label">Dimensions</p>
+                <p class="text-sm text-slate-300" x-text="currentPhoto.width ? `${currentPhoto.width}×${currentPhoto.height}` : '—'"></p>
+              </div>
+            </div>
+
+            <!-- EXIF -->
+            <template x-if="currentPhoto.exif && (currentPhoto.exif.Make || currentPhoto.exif.Model || currentPhoto.exif.DateTimeOriginal || currentPhoto.exif.DateTime)">
+              <div>
+                <p class="label">Camera</p>
+                <div class="space-y-1">
+                  <template x-if="currentPhoto.exif.Make || currentPhoto.exif.Model">
+                    <p class="text-sm text-slate-300"
+                       x-text="[currentPhoto.exif.Make, currentPhoto.exif.Model].filter(Boolean).join(' ')"></p>
+                  </template>
+                  <template x-if="currentPhoto.exif.DateTimeOriginal || currentPhoto.exif.DateTime">
+                    <p class="text-xs text-slate-500 font-mono"
+                       x-text="currentPhoto.exif.DateTimeOriginal || currentPhoto.exif.DateTime"></p>
+                  </template>
+                </div>
+              </div>
+            </template>
+
+            <!-- Similar photos -->
+            <template x-if="getSimilar().length > 0">
+              <div>
+                <div class="flex items-center justify-between mb-2">
+                  <p class="label">Similar photos</p>
+                  <span class="text-xs text-violet-400 font-semibold" x-text="getSimilar().length + ' found'"></span>
+                </div>
+                <div class="grid grid-cols-3 gap-1.5">
+                  <template x-for="sim in getSimilar()" :key="sim">
+                    <div class="relative cursor-pointer group" @click="jumpTo(sim)">
+                      <img :src="`/api/image?path=${encodeURIComponent(sim)}`"
+                           class="w-full h-16 object-cover rounded-lg bg-slate-800 group-hover:ring-2 ring-violet-500 transition-all" />
+                      <div x-show="classifications[sim]"
+                           class="absolute inset-0 rounded-lg opacity-60"
+                           :class="actionOverlayClass(classifications[sim])"></div>
+                      <span x-show="classifications[sim]"
+                            class="absolute bottom-0.5 left-0 right-0 text-center text-[9px] font-bold uppercase"
+                            :class="actionTextClass(classifications[sim])"
+                            x-text="classifications[sim]"></span>
+                    </div>
+                  </template>
+                </div>
+                <p class="text-xs text-slate-600 mt-2">Click to jump · <button class="text-violet-500 hover:text-violet-400" @click="showGroups">View all groups</button></p>
+              </div>
+            </template>
+
+            <!-- Indexing indicator -->
+            <div x-show="groupsLoading" class="flex items-center gap-2 text-xs text-slate-600">
+              <span class="w-3 h-3 border border-slate-600 border-t-transparent rounded-full animate-spin flex-shrink-0"></span>
+              Indexing similar photos…
+            </div>
+
+          </div>
+        </template>
+
+        <template x-if="loadingPhoto && !currentPhoto">
+          <div class="space-y-4 animate-pulse">
+            <div class="h-3 bg-slate-800 rounded w-3/4"></div>
+            <div class="h-2 bg-slate-800 rounded w-full"></div>
+            <div class="h-2 bg-slate-800 rounded w-5/6"></div>
+            <div class="h-2 bg-slate-800 rounded w-2/3"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Bottom bar -->
+    <div class="flex items-center justify-center gap-3 px-4 py-2.5 bg-slate-900 border-t border-slate-800 flex-shrink-0">
+      <button @click="navigate(-1)" class="flex items-center gap-1.5 text-slate-400 hover:text-white text-sm transition-colors px-2 py-1.5">
+        <kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono text-xs">←</kbd> Prev
+      </button>
+      <div class="w-px h-5 bg-slate-700"></div>
+      <button @click="classify('favorite')" class="action-btn bg-amber-950/60 hover:bg-amber-900/60 text-amber-300 border-amber-800/40">
+        <kbd class="bg-amber-900/70 px-1.5 py-0.5 rounded font-mono text-xs">F</kbd> Favorite
+      </button>
+      <button @click="classify('keep')" class="action-btn bg-green-950/60 hover:bg-green-900/60 text-green-300 border-green-800/40">
+        <kbd class="bg-green-900/70 px-1.5 py-0.5 rounded font-mono text-xs">K</kbd> Keep
+      </button>
+      <button @click="classify('unsure')" class="action-btn bg-yellow-950/60 hover:bg-yellow-900/60 text-yellow-300 border-yellow-800/40">
+        <kbd class="bg-yellow-900/70 px-1.5 py-0.5 rounded font-mono text-xs">U</kbd> Unsure
+      </button>
+      <button @click="classify('delete')" class="action-btn bg-red-950/60 hover:bg-red-900/60 text-red-300 border-red-800/40">
+        <kbd class="bg-red-900/70 px-1.5 py-0.5 rounded font-mono text-xs">D</kbd> Delete
+      </button>
+      <div class="w-px h-5 bg-slate-700"></div>
+      <button @click="navigate(1)" class="flex items-center gap-1.5 text-slate-400 hover:text-white text-sm transition-colors px-2 py-1.5">
+        Next <kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono text-xs">→</kbd>
+      </button>
+      <div class="w-px h-5 bg-slate-700 ml-1"></div>
+      <button @click="undo()" class="text-slate-500 hover:text-slate-300 text-xs transition-colors px-2 py-1.5">
+        <kbd class="bg-slate-800 px-1.5 py-0.5 rounded font-mono text-xs">Z</kbd> Undo
+      </button>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════ GROUPS -->
+  <div x-show="screen === 'groups'" class="h-screen flex flex-col overflow-hidden">
+
+    <div class="flex items-center justify-between px-5 py-3 bg-slate-900 border-b border-slate-800 flex-shrink-0">
+      <div class="flex items-center gap-3">
+        <button @click="screen = 'sorting'" class="text-slate-400 hover:text-white transition-colors text-sm">← Back</button>
+        <h2 class="text-sm font-semibold text-white">Similar Photo Groups</h2>
+        <span class="text-xs text-slate-500" x-show="!groupsLoading">
+          <span x-text="groups.length"></span> group<span x-show="groups.length !== 1">s</span>
+        </span>
+      </div>
+      <p class="text-xs text-slate-600">Grouped by visual similarity (burst shots, duplicates). Click any photo to jump to it.</p>
+    </div>
+
+    <!-- Loading state -->
+    <div x-show="groupsLoading" class="flex-1 flex items-center justify-center">
+      <div class="text-center space-y-3">
+        <div class="w-8 h-8 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+        <p class="text-slate-500 text-sm">Computing similarity index…</p>
+        <p class="text-slate-600 text-xs">This runs once; results are cached in the folder database.</p>
+      </div>
+    </div>
+
+    <!-- Empty state -->
+    <div x-show="!groupsLoading && groups.length === 0" class="flex-1 flex items-center justify-center">
+      <div class="text-center space-y-2">
+        <p class="text-slate-400 text-sm font-medium">No similar groups found</p>
+        <p class="text-slate-600 text-xs">All photos look visually distinct from each other.</p>
+      </div>
+    </div>
+
+    <!-- Groups list -->
+    <div x-show="!groupsLoading && groups.length > 0" class="flex-1 overflow-y-auto p-6 space-y-5">
+      <template x-for="(group, gi) in groups" :key="gi">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-xs text-slate-500 font-medium">
+              <span x-text="group.length"></span> similar photos
+            </span>
+            <!-- Classify-all buttons -->
+            <div class="flex items-center gap-1.5">
+              <span class="text-xs text-slate-600 mr-1">Classify all:</span>
+              <button @click="classifyGroup(group, 'favorite')"
+                      class="text-amber-400 hover:bg-amber-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-amber-800/30">★ Fav</button>
+              <button @click="classifyGroup(group, 'keep')"
+                      class="text-green-400 hover:bg-green-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-green-800/30">♥ Keep</button>
+              <button @click="classifyGroup(group, 'unsure')"
+                      class="text-yellow-400 hover:bg-yellow-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-yellow-800/30">? Unsure</button>
+              <button @click="classifyGroup(group, 'delete')"
+                      class="text-red-400 hover:bg-red-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-red-800/30">✕ Delete</button>
+            </div>
+          </div>
+
+          <div class="flex gap-2 overflow-x-auto pb-1">
+            <template x-for="member in group" :key="member.path">
+              <div class="relative flex-shrink-0 cursor-pointer group" @click="jumpTo(member.path)" style="width: 140px">
+                <img :src="`/api/image?path=${encodeURIComponent(member.path)}`"
+                     class="w-full h-24 object-cover rounded-xl bg-slate-800 group-hover:ring-2 ring-violet-500 transition-all" />
+                <!-- Classification overlay -->
+                <div x-show="classifications[member.path]"
+                     class="absolute inset-0 rounded-xl opacity-40"
+                     :class="actionOverlayClass(classifications[member.path])"></div>
+                <div x-show="classifications[member.path]"
+                     class="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md text-xs font-bold uppercase"
+                     :class="actionBadgeClass(classifications[member.path])"
+                     x-text="classifications[member.path]"></div>
+                <p class="text-xs text-slate-500 mt-1 truncate" x-text="member.path.split('/').pop()"></p>
+              </div>
+            </template>
+          </div>
+
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════ REVIEW -->
+  <div x-show="screen === 'review'" class="min-h-screen p-8">
+    <div class="max-w-4xl mx-auto">
+
+      <div class="flex items-center justify-between mb-7">
+        <h2 class="text-xl font-bold text-white">Review &amp; Confirm</h2>
+        <button @click="screen = 'sorting'" class="text-slate-400 hover:text-white text-sm transition-colors">← Back to sorting</button>
+      </div>
+
+      <div class="grid grid-cols-5 gap-3 mb-8">
+        <div class="bg-amber-950/50 border border-amber-800/40 rounded-2xl p-4 text-center">
+          <p class="text-3xl font-bold text-amber-400 tabular-nums" x-text="countAction('favorite')"></p>
+          <p class="text-amber-300/50 text-xs mt-1 font-medium uppercase tracking-wider">★ Fav</p>
+        </div>
+        <div class="bg-green-950/50 border border-green-800/40 rounded-2xl p-4 text-center">
+          <p class="text-3xl font-bold text-green-400 tabular-nums" x-text="countAction('keep')"></p>
+          <p class="text-green-300/50 text-xs mt-1 font-medium uppercase tracking-wider">Keep</p>
+        </div>
+        <div class="bg-red-950/50 border border-red-800/40 rounded-2xl p-4 text-center">
+          <p class="text-3xl font-bold text-red-400 tabular-nums" x-text="countAction('delete')"></p>
+          <p class="text-red-300/50 text-xs mt-1 font-medium uppercase tracking-wider">Delete</p>
+        </div>
+        <div class="bg-yellow-950/50 border border-yellow-800/40 rounded-2xl p-4 text-center">
+          <p class="text-3xl font-bold text-yellow-400 tabular-nums" x-text="countAction('unsure')"></p>
+          <p class="text-yellow-300/50 text-xs mt-1 font-medium uppercase tracking-wider">Unsure</p>
+        </div>
+        <div class="bg-slate-800/60 border border-slate-700/40 rounded-2xl p-4 text-center">
+          <p class="text-3xl font-bold text-slate-500 tabular-nums" x-text="photos.length - Object.keys(classifications).length"></p>
+          <p class="text-slate-600 text-xs mt-1 font-medium uppercase tracking-wider">Unreviewed</p>
+        </div>
+      </div>
+
+      <template x-if="countAction('delete') > 0">
+        <div>
+          <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4">
+            Moving to _trash/ — <span x-text="countAction('delete')"></span> photos
+          </h3>
+          <div class="grid grid-cols-5 gap-2 mb-6 max-h-72 overflow-y-auto pr-1">
+            <template x-for="path in getDeletePhotos()" :key="path">
+              <div class="relative group">
+                <img :src="`/api/image?path=${encodeURIComponent(path)}`"
+                     class="w-full h-24 object-cover rounded-lg border border-red-800/40 bg-slate-800" />
+                <div class="absolute inset-0 bg-red-900/20 rounded-lg"></div>
+                <button @click="delete classifications[path]"
+                        class="absolute top-1 right-1 bg-slate-900/90 hover:bg-red-800 text-slate-300 hover:text-white rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all leading-none"
+                        title="Remove from delete list">×</button>
+                <p class="text-xs text-slate-500 mt-1 truncate" x-text="path.split('/').pop()"></p>
+              </div>
+            </template>
+          </div>
+
+          <div class="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 mb-5 text-sm text-slate-400 leading-relaxed">
+            These <strong class="text-white" x-text="countAction('delete')"></strong> photos will be moved to
+            <code class="bg-slate-900 text-slate-300 px-1.5 py-0.5 rounded font-mono text-xs">_trash/</code>
+            inside your folder. They are <strong class="text-white">not permanently deleted</strong>.
+          </div>
+
+          <button @click="executeDelete" :disabled="executing"
+                  class="bg-red-600 hover:bg-red-500 active:bg-red-700 disabled:opacity-50 text-white font-semibold px-6 py-3 rounded-xl transition-colors">
+            <span x-show="!executing">Move <span x-text="countAction('delete')"></span> photos to trash →</span>
+            <span x-show="executing">Moving…</span>
+          </button>
+        </div>
+      </template>
+
+      <div x-show="countAction('delete') === 0" class="text-slate-600 text-sm">
+        No photos marked for deletion.
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════ DONE -->
+  <div x-show="screen === 'done'" class="min-h-screen flex items-center justify-center p-4">
+    <div class="bg-slate-800/80 backdrop-blur border border-slate-700/60 rounded-2xl p-8 w-full max-w-md text-center shadow-2xl">
+      <div class="w-14 h-14 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+        <span class="text-green-400 text-2xl">✓</span>
+      </div>
+      <h2 class="text-xl font-bold text-white mb-1">Done!</h2>
+      <template x-if="deleteResults">
+        <div class="space-y-2 text-sm text-slate-400 mt-3">
+          <p><span class="text-white font-semibold" x-text="deleteResults.moved.length"></span> photo<span x-show="deleteResults.moved.length !== 1">s</span> moved to trash</p>
+          <p class="font-mono text-xs text-slate-600 break-all" x-text="deleteResults.trash"></p>
+          <template x-if="deleteResults.errors.length > 0">
+            <div class="bg-red-950/50 border border-red-800/40 rounded-xl p-3 mt-3 text-left">
+              <p class="text-red-400 text-xs font-semibold mb-1">Errors (<span x-text="deleteResults.errors.length"></span>)</p>
+              <template x-for="err in deleteResults.errors" :key="err.name">
+                <p class="text-red-400/60 text-xs" x-text="`${err.name}: ${err.error}`"></p>
+              </template>
+            </div>
+          </template>
+        </div>
+      </template>
+      <button @click="screen = 'setup'; folderPath = ''"
+              class="mt-6 bg-blue-600 hover:bg-blue-500 text-white font-semibold px-5 py-2.5 rounded-xl text-sm transition-colors">
+        Sort another folder
+      </button>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════ BROWSER MODAL -->
+  <div x-show="browserOpen" class="fixed inset-0 z-50 flex items-center justify-center p-4"
+       @keydown.escape.window="browserOpen = false">
+    <div class="absolute inset-0 bg-black/70 backdrop-blur-sm" @click="browserOpen = false"></div>
+    <div class="relative bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-lg flex flex-col" style="max-height: 80vh">
+      <div class="flex items-center justify-between px-5 py-4 border-b border-slate-700 flex-shrink-0">
+        <h3 class="text-sm font-semibold text-white">Choose a folder</h3>
+        <button @click="browserOpen = false" class="text-slate-500 hover:text-white transition-colors text-lg leading-none">×</button>
+      </div>
+      <div class="px-5 py-3 border-b border-slate-700/60 flex-shrink-0">
+        <div class="flex items-center gap-1 flex-wrap">
+          <button x-show="browserParent" @click="browseTo(browserParent)"
+                  class="text-slate-400 hover:text-white transition-colors text-xs p-1 rounded hover:bg-slate-700" title="Go up">↑</button>
+          <p class="text-slate-400 font-mono text-xs break-all" x-text="browserPath"></p>
+        </div>
+      </div>
+      <div class="overflow-y-auto flex-1 px-2 py-2">
+        <div x-show="browserLoading" class="flex items-center justify-center py-10">
+          <div class="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+        </div>
+        <div x-show="!browserLoading && browserDirs.length === 0" class="text-slate-600 text-sm text-center py-10">
+          No subfolders here
+        </div>
+        <template x-for="dir in browserDirs" :key="dir.path">
+          <button @click="browseTo(dir.path)"
+                  class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-slate-700/60 transition-colors text-left group">
+            <span class="text-slate-400 group-hover:text-slate-200 transition-colors flex-shrink-0">
+              <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/>
+              </svg>
+            </span>
+            <span class="text-slate-200 text-sm truncate" x-text="dir.name"></span>
+            <span class="ml-auto text-slate-600 group-hover:text-slate-400 text-xs transition-colors flex-shrink-0">→</span>
+          </button>
+        </template>
+      </div>
+      <div class="px-5 py-4 border-t border-slate-700 flex-shrink-0 flex items-center justify-between gap-3">
+        <p class="text-slate-500 text-xs truncate" x-text="browserPath"></p>
+        <button @click="selectBrowserPath()"
+                class="flex-shrink-0 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold px-4 py-2 rounded-xl transition-colors">
+          Select this folder
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <style>
+    .label { @apply text-xs text-slate-500 uppercase tracking-wider font-semibold mb-1; }
+    .action-btn { @apply flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-colors border; }
+  </style>
+
+  <script>
+    function app() {
+      return {
+        screen: 'setup',
+        folderPath: '',
+        folderError: '',
+
+        photos: [],
+        current: 0,
+        currentPhoto: null,
+        loadingPhoto: false,
+
+        classifications: {},
+        flashAction: null,
+        flashTimer: null,
+
+        // Similarity groups
+        groups: [],
+        groupMap: {},   // path -> [similar paths]
+        groupsLoading: false,
+
+        executing: false,
+        deleteResults: null,
+
+        // Browser modal
+        browserOpen: false,
+        browserPath: '',
+        browserParent: null,
+        browserDirs: [],
+        browserLoading: false,
+
+        // ── Folder setup ──────────────────────────────────────────────
+
+        async submitFolder() {
+          const folder = this.folderPath.trim();
+          if (!folder) return;
+          this.folderError = '';
+          this.screen = 'loading';
+          try {
+            const res = await fetch('/api/folder', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ folder }),
+            });
+            if (!res.ok) {
+              this.folderError = (await res.json()).detail || 'Could not open folder';
+              this.screen = 'setup';
+              return;
+            }
+            const data = await res.json();
+            if (data.count === 0) {
+              this.folderError = 'No images found in this folder';
+              this.screen = 'setup';
+              return;
+            }
+            this.photos = data.photos;
+            this.classifications = data.classifications || {};  // restore from DB
+            this.groups = [];
+            this.groupMap = {};
+            this.current = 0;
+            this.screen = 'sorting';
+            await this.loadPhoto(0);
+            this.loadGroupsBackground();
+          } catch {
+            this.folderError = 'Could not reach server — is app.py running?';
+            this.screen = 'setup';
+          }
+        },
+
+        // ── Photo loading ─────────────────────────────────────────────
+
+        async loadPhoto(index) {
+          if (index < 0 || index >= this.photos.length) return;
+          this.loadingPhoto = true;
+          this.currentPhoto = null;
+          try {
+            const res = await fetch(`/api/analyze?path=${encodeURIComponent(this.photos[index])}`);
+            if (res.ok) this.currentPhoto = await res.json();
+          } finally {
+            this.loadingPhoto = false;
+          }
+          // Prefetch next
+          const next = index + 1;
+          if (next < this.photos.length)
+            fetch(`/api/analyze?path=${encodeURIComponent(this.photos[next])}`).catch(() => {});
+        },
+
+        // ── Classification ────────────────────────────────────────────
+
+        async classify(action) {
+          if (!this.currentPhoto) return;
+          const path = this.currentPhoto.path;
+          this.classifications = { ...this.classifications, [path]: action };
+          fetch('/api/classify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path, action }),
+          }).catch(() => {});
+          clearTimeout(this.flashTimer);
+          this.flashAction = action;
+          this.flashTimer = setTimeout(() => { this.flashAction = null; }, 380);
+          await this.navigate(1);
+        },
+
+        async classifyGroup(group, action) {
+          const updated = { ...this.classifications };
+          for (const member of group) {
+            updated[member.path] = action;
+            fetch('/api/classify', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: member.path, action }),
+            }).catch(() => {});
+          }
+          this.classifications = updated;
+          // Refresh groups to show updated badges
+          this.groups = this.groups.map(g =>
+            g.map(m => ({ ...m, classification: updated[m.path] || null }))
+          );
+        },
+
+        undo() {
+          if (!this.currentPhoto) return;
+          const path = this.currentPhoto.path;
+          const updated = { ...this.classifications };
+          delete updated[path];
+          this.classifications = updated;
+        },
+
+        async navigate(dir) {
+          const next = this.current + dir;
+          if (next < 0 || next >= this.photos.length) return;
+          this.current = next;
+          await this.loadPhoto(next);
+        },
+
+        async jumpTo(path) {
+          const idx = this.photos.indexOf(path);
+          if (idx === -1) return;
+          this.current = idx;
+          await this.loadPhoto(idx);
+          this.screen = 'sorting';
+        },
+
+        // ── Groups / similarity ───────────────────────────────────────
+
+        async loadGroupsBackground() {
+          this.groupsLoading = true;
+          try {
+            const res = await fetch('/api/groups');
+            if (!res.ok) return;
+            const data = await res.json();
+            this.groups = data.groups;
+            this.buildGroupMap();
+          } finally {
+            this.groupsLoading = false;
+          }
+        },
+
+        buildGroupMap() {
+          this.groupMap = {};
+          for (const group of this.groups) {
+            const paths = group.map(m => m.path);
+            for (const p of paths) {
+              this.groupMap[p] = paths.filter(q => q !== p);
+            }
+          }
+        },
+
+        getSimilar() {
+          if (!this.currentPhoto) return [];
+          return this.groupMap[this.currentPhoto.path] || [];
+        },
+
+        showGroups() {
+          this.screen = 'groups';
+          // If groups haven't loaded yet, trigger now
+          if (!this.groupsLoading && this.groups.length === 0) {
+            this.loadGroupsBackground();
+          }
+        },
+
+        // ── Review / execute ──────────────────────────────────────────
+
+        countAction(action) {
+          return Object.values(this.classifications).filter(a => a === action).length;
+        },
+
+        getDeletePhotos() {
+          return Object.entries(this.classifications)
+            .filter(([, a]) => a === 'delete')
+            .map(([p]) => p);
+        },
+
+        openReview() { this.screen = 'review'; },
+
+        async executeDelete() {
+          this.executing = true;
+          try {
+            const res = await fetch('/api/execute', { method: 'POST' });
+            this.deleteResults = await res.json();
+            this.screen = 'done';
+          } finally {
+            this.executing = false;
+          }
+        },
+
+        // ── Keyboard ──────────────────────────────────────────────────
+
+        handleKey(event) {
+          if (['INPUT', 'TEXTAREA'].includes(event.target.tagName)) return;
+          const key = event.key.toLowerCase();
+
+          if (this.screen === 'sorting') {
+            if (key === 'k') { event.preventDefault(); this.classify('keep'); }
+            else if (key === 'd') { event.preventDefault(); this.classify('delete'); }
+            else if (key === 'f') { event.preventDefault(); this.classify('favorite'); }
+            else if (key === 'u') { event.preventDefault(); this.classify('unsure'); }
+            else if (key === 'z') { event.preventDefault(); this.undo(); }
+            else if (key === 'g') { event.preventDefault(); this.showGroups(); }
+            else if (event.key === 'ArrowLeft')  { event.preventDefault(); this.navigate(-1); }
+            else if (event.key === 'ArrowRight') { event.preventDefault(); this.navigate(1); }
+          } else if (this.screen === 'groups') {
+            if (key === 'g' || event.key === 'Escape') { event.preventDefault(); this.screen = 'sorting'; }
+          }
+        },
+
+        // ── Browser modal ─────────────────────────────────────────────
+
+        async openBrowser() {
+          this.browserOpen = true;
+          await this.browseTo(this.folderPath || '');
+        },
+
+        async browseTo(path) {
+          this.browserLoading = true;
+          try {
+            const res = await fetch(`/api/browse?path=${encodeURIComponent(path)}`);
+            if (!res.ok) { if (path) return this.browseTo(''); return; }
+            const data = await res.json();
+            this.browserPath = data.path;
+            this.browserParent = data.parent;
+            this.browserDirs = data.dirs;
+          } finally {
+            this.browserLoading = false;
+          }
+        },
+
+        selectBrowserPath() {
+          this.folderPath = this.browserPath;
+          this.browserOpen = false;
+        },
+
+        // ── Style helpers ─────────────────────────────────────────────
+
+        actionBadgeClass(action) {
+          return {
+            'bg-green-500/80 text-green-900':   action === 'keep',
+            'bg-red-500/80 text-red-900':       action === 'delete',
+            'bg-amber-400/80 text-amber-900':   action === 'favorite',
+            'bg-yellow-400/80 text-yellow-900': action === 'unsure',
+          };
+        },
+
+        actionOverlayClass(action) {
+          return {
+            'bg-green-600':  action === 'keep',
+            'bg-red-600':    action === 'delete',
+            'bg-amber-500':  action === 'favorite',
+            'bg-yellow-500': action === 'unsure',
+          };
+        },
+
+        actionTextClass(action) {
+          return {
+            'text-green-300':  action === 'keep',
+            'text-red-300':    action === 'delete',
+            'text-amber-300':  action === 'favorite',
+            'text-yellow-300': action === 'unsure',
+          };
+        },
+
+        blurScoreColor(score) {
+          if (score < 0)   return 'text-slate-500';
+          if (score < 100) return 'text-red-400';
+          if (score < 500) return 'text-yellow-400';
+          return 'text-green-400';
+        },
+
+        blurBarClass(score) {
+          if (score < 0)   return 'bg-slate-600';
+          if (score < 100) return 'bg-red-500';
+          if (score < 500) return 'bg-yellow-500';
+          return 'bg-green-500';
+        },
+
+        blurBarWidth(score) {
+          if (score < 0) return 40;
+          return Math.min(score / 1000 * 100, 100);
+        },
+
+        blurLabel(score) {
+          if (score < 0)   return 'Could not analyze';
+          if (score < 100) return 'Very blurry';
+          if (score < 500) return 'Possibly blurry';
+          return 'Sharp';
+        },
+      };
+    }
+  </script>
+</body>
+</html>
