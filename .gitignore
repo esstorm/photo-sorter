@@ -4,7 +4,5 @@ __pycache__/
 *.pyo
 .DS_Store
 
-# Per-folder databases created at runtime — not part of the project
-*/_photo_sorter.db
-_photo_sorter.db
+# Runtime artifacts — not part of the project
 _trash/

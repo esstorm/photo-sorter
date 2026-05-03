@@ -3,7 +3,6 @@ import json
 import os
 import shutil
 import sqlite3
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,7 +18,6 @@ app = FastAPI()
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp", ".bmp"}
 
-# RAW formats paired with viewable images (same stem, different extension)
 RAW_EXTENSIONS = {
     ".cr2", ".cr3",           # Canon
     ".nef", ".nrw",           # Nikon
@@ -34,55 +32,27 @@ RAW_EXTENSIONS = {
     ".iiq",                   # Phase One
     ".x3f",                   # Sigma
 }
+
 BLUR_THRESHOLD = 500.0
 SIMILARITY_THRESHOLD = 10
 
-# Per-project DBs live inside each folder; the projects registry lives here.
-REGISTRY_PATH = Path.home() / ".photo_sorter" / "projects.json"
+# Central database — one file for all projects
+CONFIG_DIR = Path.home() / ".config" / "photo_sorter"
+DB_PATH = CONFIG_DIR / "photos.db"
 
-# In-memory analysis cache — keyed by absolute path, shared across folders.
+# In-memory analysis cache keyed by absolute path
 analysis_cache: dict = {}
 
 
-# ── Projects registry ─────────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 
-def load_registry() -> list:
-    try:
-        return json.loads(REGISTRY_PATH.read_text())
-    except Exception:
-        return []
-
-
-def save_registry(projects: list) -> None:
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REGISTRY_PATH.write_text(json.dumps(projects, indent=2))
-
-
-def registry_upsert(folder: str, total: int, stats: dict) -> None:
-    projects = load_registry()
-    entry = next((p for p in projects if p["folder"] == folder), None)
-    record = {
-        "folder": folder,
-        "name": Path(folder).name,
-        "last_opened": datetime.now(timezone.utc).isoformat(),
-        "total": total,
-        "stats": stats,
-    }
-    if entry:
-        entry.update(record)
-    else:
-        projects.insert(0, record)
-    save_registry(projects[:20])
-
-
-# ── Per-folder SQLite ─────────────────────────────────────────────────────────
-
-def init_db(folder: str) -> None:
-    db_path = Path(folder) / "_photo_sorter.db"
-    conn = sqlite3.connect(str(db_path))
+def init_db() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS photos (
             path            TEXT PRIMARY KEY,
+            folder          TEXT NOT NULL,
             name            TEXT,
             size_mb         REAL,
             width           INTEGER,
@@ -96,38 +66,59 @@ def init_db(folder: str) -> None:
             classified_at   TEXT,
             raw_companion   TEXT
         );
+        CREATE TABLE IF NOT EXISTS projects (
+            folder       TEXT PRIMARY KEY,
+            name         TEXT,
+            last_opened  TEXT,
+            total        INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_folder    ON photos(folder);
+        CREATE INDEX IF NOT EXISTS idx_dhash     ON photos(dhash);
+        CREATE INDEX IF NOT EXISTS idx_file_hash ON photos(file_hash);
     """)
-    # Migration: add column for databases created before RAW support
-    try:
-        conn.execute("ALTER TABLE photos ADD COLUMN raw_companion TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    conn.commit()
     conn.close()
 
 
-def get_db(folder: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(Path(folder) / "_photo_sorter.db"), check_same_thread=False)
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def db_stats(folder: str) -> dict:
     try:
-        with get_db(folder) as conn:
+        with get_db() as conn:
             rows = conn.execute(
                 "SELECT classification, COUNT(*) AS n FROM photos "
-                "WHERE classification IS NOT NULL GROUP BY classification"
+                "WHERE folder=? AND classification IS NOT NULL GROUP BY classification",
+                (folder,),
             ).fetchall()
         return {r["classification"]: r["n"] for r in rows}
     except Exception:
         return {}
 
 
+# ── Projects registry ─────────────────────────────────────────────────────────
+
+def registry_upsert(folder: str, total: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO projects (folder, name, last_opened, total)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(folder) DO UPDATE SET
+                name=excluded.name,
+                last_opened=excluded.last_opened,
+                total=excluded.total
+            """,
+            (folder, Path(folder).name, datetime.now(timezone.utc).isoformat(), total),
+        )
+
+
 # ── Security ──────────────────────────────────────────────────────────────────
 
 def validate_path(path: str, folder: str) -> None:
-    """Raise 403 unless path is strictly inside folder."""
     real_path = str(Path(path).resolve())
     real_folder = str(Path(folder).resolve())
     if not real_path.startswith(real_folder + os.sep):
@@ -142,6 +133,15 @@ def require_valid_folder(folder: str) -> str:
 
 
 # ── Image analysis ────────────────────────────────────────────────────────────
+
+def find_raw_companion(path: str) -> str:
+    p = Path(path)
+    for ext in RAW_EXTENSIONS:
+        for candidate in (p.with_suffix(ext), p.with_suffix(ext.upper())):
+            if candidate.exists() and candidate.resolve() != p.resolve():
+                return str(candidate)
+    return ""
+
 
 def compute_dhash(path: str) -> str:
     try:
@@ -201,16 +201,6 @@ def get_exif(path: str) -> dict:
         return {}
 
 
-def find_raw_companion(path: str) -> str:
-    """Return the path of a RAW sidecar with the same stem, or empty string."""
-    p = Path(path)
-    for ext in RAW_EXTENSIONS:
-        for candidate in (p.with_suffix(ext), p.with_suffix(ext.upper())):
-            if candidate.exists() and candidate.resolve() != p.resolve():
-                return str(candidate)
-    return ""
-
-
 def analyze(path: str, folder: str) -> dict:
     if path in analysis_cache:
         return analysis_cache[path]
@@ -221,6 +211,7 @@ def analyze(path: str, folder: str) -> dict:
     exif = get_exif(path)
     dhash = compute_dhash(path)
     file_hash = compute_file_hash(path)
+    raw_companion = find_raw_companion(path)
 
     try:
         with Image.open(path) as img:
@@ -228,7 +219,19 @@ def analyze(path: str, folder: str) -> dict:
     except Exception:
         w, h = 0, 0
 
-    raw_companion = find_raw_companion(path)
+    # Cross-folder exact duplicates (same file_hash, different folder)
+    cross_dupes = []
+    if file_hash:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT path, folder FROM photos WHERE file_hash=? AND path!=?",
+                (file_hash, path),
+            ).fetchall()
+        cross_dupes = [
+            {"path": r["path"], "folder": r["folder"], "name": Path(r["path"]).name}
+            for r in rows
+            if r["folder"] != folder
+        ]
 
     result = {
         "path": path,
@@ -243,24 +246,26 @@ def analyze(path: str, folder: str) -> dict:
         "exif": exif,
         "raw_companion": raw_companion,
         "raw_name": Path(raw_companion).name if raw_companion else "",
+        "cross_folder_duplicates": cross_dupes,
     }
     analysis_cache[path] = result
 
-    with get_db(folder) as conn:
+    with get_db() as conn:
         conn.execute(
             """
             INSERT INTO photos
-                (path, name, size_mb, width, height, blur_score,
+                (path, folder, name, size_mb, width, height, blur_score,
                  suggest_delete, file_hash, dhash, exif_json, raw_companion)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
+                folder=excluded.folder,
                 size_mb=excluded.size_mb, width=excluded.width,
                 height=excluded.height, blur_score=excluded.blur_score,
                 suggest_delete=excluded.suggest_delete,
                 file_hash=excluded.file_hash, dhash=excluded.dhash,
                 exif_json=excluded.exif_json, raw_companion=excluded.raw_companion
             """,
-            (path, f.name, result["size_mb"], w, h, round(score, 1),
+            (path, folder, f.name, result["size_mb"], w, h, round(score, 1),
              int(result["suggest_delete"]), file_hash, dhash, json.dumps(exif), raw_companion),
         )
     return result
@@ -294,6 +299,21 @@ def scan_photos(folder: str) -> list:
     )
 
 
+# ── Move helper ───────────────────────────────────────────────────────────────
+
+def _move_to_trash(src: Path, trash: Path) -> str | None:
+    dst = trash / src.name
+    counter = 1
+    while dst.exists():
+        dst = trash / f"{src.stem}_{counter}{src.suffix}"
+        counter += 1
+    try:
+        shutil.move(str(src), str(dst))
+        return src.name
+    except Exception:
+        return None
+
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class ClassifyReq(BaseModel):
@@ -310,52 +330,72 @@ class ExecuteReq(BaseModel):
 
 @app.get("/api/projects")
 def get_projects():
-    return {"projects": load_registry()}
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT p.folder, p.name, p.last_opened, p.total, "
+            "   COUNT(CASE WHEN ph.classification='favorite' THEN 1 END) AS fav, "
+            "   COUNT(CASE WHEN ph.classification='keep'     THEN 1 END) AS keep, "
+            "   COUNT(CASE WHEN ph.classification='delete'   THEN 1 END) AS del, "
+            "   COUNT(CASE WHEN ph.classification='unsure'   THEN 1 END) AS unsure "
+            "FROM projects p "
+            "LEFT JOIN photos ph ON ph.folder=p.folder "
+            "GROUP BY p.folder "
+            "ORDER BY p.last_opened DESC LIMIT 20"
+        ).fetchall()
+    return {
+        "projects": [
+            {
+                "folder": r["folder"],
+                "name": r["name"],
+                "last_opened": r["last_opened"],
+                "total": r["total"],
+                "stats": {
+                    "favorite": r["fav"],
+                    "keep": r["keep"],
+                    "delete": r["del"],
+                    "unsure": r["unsure"],
+                },
+            }
+            for r in rows
+        ]
+    }
 
 
 @app.get("/api/folder")
 def open_folder(path: str):
     folder = require_valid_folder(path)
-    init_db(folder)
-
     photos = scan_photos(folder)
 
-    # Eagerly find RAW companions for every photo (fast — just path checks, no image decode)
+    # Persist companions eagerly (pure path checks, no image decode)
     companions: dict = {}
     for photo_path in photos:
         raw = find_raw_companion(photo_path)
         if raw:
             companions[photo_path] = raw
 
-    # Persist companions to DB (upsert only those found, don't overwrite existing full analysis)
-    if companions:
-        with get_db(folder) as conn:
-            for photo_path, raw_path in companions.items():
-                conn.execute(
-                    "INSERT INTO photos (path, name, raw_companion) VALUES (?,?,?) "
-                    "ON CONFLICT(path) DO UPDATE SET raw_companion=excluded.raw_companion",
-                    (photo_path, Path(photo_path).name, raw_path),
-                )
+    with get_db() as conn:
+        for photo_path, raw_path in companions.items():
+            conn.execute(
+                "INSERT INTO photos (path, folder, name, raw_companion) VALUES (?,?,?,?) "
+                "ON CONFLICT(path) DO UPDATE SET raw_companion=excluded.raw_companion",
+                (photo_path, folder, Path(photo_path).name, raw_path),
+            )
 
-    classifications = {}
-    if photos:
-        placeholders = ",".join("?" * len(photos))
-        with get_db(folder) as conn:
-            rows = conn.execute(
-                f"SELECT path, classification FROM photos WHERE path IN ({placeholders})",
-                photos,
-            ).fetchall()
-        classifications = {r["path"]: r["classification"] for r in rows if r["classification"]}
+        placeholders = ",".join("?" * len(photos)) if photos else "''"
+        rows = conn.execute(
+            f"SELECT path, classification FROM photos WHERE path IN ({placeholders})",
+            photos,
+        ).fetchall() if photos else []
 
-    stats = db_stats(folder)
-    registry_upsert(folder, len(photos), stats)
+    classifications = {r["path"]: r["classification"] for r in rows if r["classification"]}
+    registry_upsert(folder, len(photos))
 
     return {
         "photos": photos,
         "count": len(photos),
         "classifications": classifications,
         "companions": companions,
-        "stats": stats,
+        "stats": db_stats(folder),
     }
 
 
@@ -382,17 +422,19 @@ def classify(req: ClassifyReq):
     folder = require_valid_folder(req.folder)
     validate_path(req.path, folder)
     now = datetime.now(timezone.utc).isoformat()
-    with get_db(folder) as conn:
+    with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO photos (path, name, classification, classified_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO photos (path, folder, name, classification, classified_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 classification=excluded.classification,
                 classified_at=excluded.classified_at
             """,
-            (req.path, Path(req.path).name, req.action, now),
+            (req.path, folder, Path(req.path).name, req.action, now),
         )
+    # Invalidate cache so cross_folder_duplicates refresh on next analyze
+    analysis_cache.pop(req.path, None)
     return {"ok": True}
 
 
@@ -404,7 +446,7 @@ def get_groups(folder: str):
         return {"groups": []}
 
     placeholders = ",".join("?" * len(photos))
-    with get_db(folder) as conn:
+    with get_db() as conn:
         db_rows = conn.execute(
             f"SELECT path, dhash, classification FROM photos WHERE path IN ({placeholders})",
             photos,
@@ -415,18 +457,18 @@ def get_groups(folder: str):
     for path in photos:
         if not existing.get(path, {}).get("dhash"):
             dhash = compute_dhash(path)
-            with get_db(folder) as conn:
+            with get_db() as conn:
                 conn.execute(
-                    "INSERT INTO photos (path, name, dhash) VALUES (?,?,?) "
+                    "INSERT INTO photos (path, folder, name, dhash) VALUES (?,?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET dhash=excluded.dhash",
-                    (path, Path(path).name, dhash),
+                    (path, folder, Path(path).name, dhash),
                 )
             existing.setdefault(path, {})["dhash"] = dhash
 
     rows = [{"path": p, "dhash": existing.get(p, {}).get("dhash", "")} for p in photos]
     clusters = cluster_by_dhash(rows)
 
-    with get_db(folder) as conn:
+    with get_db() as conn:
         class_map = {
             r["path"]: r["classification"]
             for r in conn.execute(
@@ -443,26 +485,13 @@ def get_groups(folder: str):
     }
 
 
-def _move_to_trash(src: Path, trash: Path) -> str | None:
-    """Move src into trash, avoiding collisions. Returns destination name or None on error."""
-    dst = trash / src.name
-    counter = 1
-    while dst.exists():
-        dst = trash / f"{src.stem}_{counter}{src.suffix}"
-        counter += 1
-    try:
-        shutil.move(str(src), str(dst))
-        return src.name
-    except Exception:
-        return None
-
-
 @app.post("/api/execute")
 def execute(req: ExecuteReq):
     folder = require_valid_folder(req.folder)
-    with get_db(folder) as conn:
+    with get_db() as conn:
         rows = conn.execute(
-            "SELECT path, raw_companion FROM photos WHERE classification='delete'"
+            "SELECT path, raw_companion FROM photos WHERE folder=? AND classification='delete'",
+            (folder,),
         ).fetchall()
 
     trash = Path(folder) / "_trash"
@@ -477,11 +506,11 @@ def execute(req: ExecuteReq):
         name = _move_to_trash(src, trash)
         if name:
             moved.append(name)
+            analysis_cache.pop(str(src), None)
         else:
             errors.append({"name": src.name, "error": "could not move"})
-            continue  # skip companion if main file failed
+            continue
 
-        # Move RAW companion — prefer DB value, fall back to live filesystem check
         raw_path = row["raw_companion"] or find_raw_companion(str(src))
         if raw_path:
             raw_src = Path(raw_path)
@@ -492,7 +521,7 @@ def execute(req: ExecuteReq):
                 else:
                     errors.append({"name": raw_src.name, "error": "could not move RAW"})
 
-    registry_upsert(folder, len(scan_photos(folder)), db_stats(folder))
+    registry_upsert(folder, len(scan_photos(folder)))
     return {"moved": moved, "raw_moved": raw_moved, "errors": errors, "trash": str(trash)}
 
 
@@ -518,4 +547,5 @@ static_dir = Path(__file__).parent / "static"
 app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 if __name__ == "__main__":
+    init_db()
     uvicorn.run(app, host="127.0.0.1", port=8765, reload=False)
