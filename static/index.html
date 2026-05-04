@@ -217,7 +217,9 @@
 
       <!-- Image area -->
       <div class="relative flex-1 flex items-center justify-center bg-slate-950 vignette min-w-0 overflow-hidden"
-           @wheel.prevent="handleGesture($event)">
+           @wheel.prevent="handleGesture($event)"
+           :style="`transform: translateX(${slideOffset}px);
+                    transition: ${slideAnimate ? 'transform 0.25s cubic-bezier(0.25,0.46,0.45,0.94)' : 'none'}`">
 
         <!-- Action flash -->
         <div x-show="flashAction" class="absolute inset-0 pointer-events-none z-20 flex items-center justify-center"
@@ -638,8 +640,11 @@
       zoom: 1,
       panX: 0,
       panY: 0,
+      slideOffset: 0,
+      slideAnimate: false,
       _swipeAccum: 0,
       _swipeTimer: null,
+      _swipeCommitting: false,
       _isPanning: false,
       _panStart: null,
 
@@ -715,6 +720,7 @@
         if (!path) return;
         this.currentPath = path;
         this.zoom = 1; this.panX = 0; this.panY = 0;
+        this.slideOffset = 0; this.slideAnimate = false;
         await this.loadPhotoData(path);
       },
 
@@ -923,15 +929,56 @@
         if (dx <= dy) return; // vertical — let sidebar scroll normally
         e.preventDefault();
 
-        this._swipeAccum += e.deltaX;
-        clearTimeout(this._swipeTimer);
-        this._swipeTimer = setTimeout(() => { this._swipeAccum = 0; }, 400);
+        if (this._swipeCommitting) return;
 
-        if (Math.abs(this._swipeAccum) > 60) {
+        this._swipeAccum += e.deltaX;
+
+        // Live drag: image follows the finger (damped so it doesn't feel 1:1)
+        this.slideAnimate = false;
+        this.slideOffset = -this._swipeAccum * 0.45;
+
+        clearTimeout(this._swipeTimer);
+        this._swipeTimer = setTimeout(() => {
+          // Finger lifted without reaching threshold — snap back
+          this._swipeAccum = 0;
+          this.slideAnimate = true;
+          this.slideOffset = 0;
+        }, 400);
+
+        if (Math.abs(this._swipeAccum) > 120) {
           const dir = this._swipeAccum > 0 ? 1 : -1;
           this._swipeAccum = 0;
-          this.navigate(dir);
+          clearTimeout(this._swipeTimer);
+          this.commitSwipe(dir);
         }
+      },
+
+      async commitSwipe(dir) {
+        this._swipeCommitting = true;
+        const W = window.innerWidth * 0.65;
+
+        // 1. Fly current image off in swipe direction
+        this.slideAnimate = true;
+        this.slideOffset = -dir * W;
+        await new Promise(r => setTimeout(r, 230));
+
+        // 2. Load next photo (image is offscreen — no flash)
+        await this.navigate(dir);
+
+        // 3. Place new image on the opposite side instantly
+        this.slideAnimate = false;
+        this.slideOffset = dir * W;
+
+        // 4. Two frames so the browser paints the new position before animating
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+        // 5. Slide into view
+        this.slideAnimate = true;
+        this.slideOffset = 0;
+        await new Promise(r => setTimeout(r, 230));
+
+        this.slideAnimate = false;
+        this._swipeCommitting = false;
       },
 
       startPan(e) {
