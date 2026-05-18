@@ -1,12 +1,19 @@
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
 
 import numpy as np
 import rawpy
@@ -190,7 +197,72 @@ def raw_preview_jpeg(path: str) -> bytes:
     return raw_preview_cache[path]
 
 
-def get_fix_hints(img: Image.Image, blur_score: float) -> list[str]:
+def detect_skew(img: Image.Image) -> tuple[float, float]:
+    """Detect image skew via Hough lines. Returns (angle_deg, confidence 0–1).
+    Positive angle = horizon tilts down to right (needs CCW correction).
+    Returns (0, 0) when no confident skew is found."""
+    if not _CV2_AVAILABLE:
+        return 0.0, 0.0
+    try:
+        small = img.copy()
+        small.thumbnail((800, 800), Image.LANCZOS)
+        gray = np.array(small.convert("L"))
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                                 threshold=80, minLineLength=60, maxLineGap=10)
+        if lines is None or len(lines) < 5:
+            return 0.0, 0.0
+
+        h_angles: list[float] = []
+        v_angles: list[float] = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 == x1:
+                v_angles.append(0.0)
+                continue
+            a = math.degrees(math.atan2(y2 - y1, x2 - x1))
+            if abs(a) <= 30:
+                h_angles.append(a)
+            elif abs(abs(a) - 90) <= 30:
+                # Convert near-vertical to equivalent horizontal skew
+                v_angles.append(-(a - 90) if a > 0 else -(a + 90))
+
+        angles = h_angles if len(h_angles) >= 5 else (h_angles + v_angles)
+        if len(angles) < 5:
+            return 0.0, 0.0
+
+        arr = np.array(angles)
+        median_angle = float(np.median(arr))
+        std_angle = float(np.std(arr))
+        confidence = min(1.0, len(arr) / 40.0) * max(0.0, 1.0 - std_angle / 15.0)
+
+        if abs(median_angle) < 0.5 or confidence < 0.25:
+            return 0.0, 0.0
+        return round(median_angle, 2), round(confidence, 2)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _largest_inscribed_rect(w: int, h: int, angle_rad: float) -> tuple[int, int]:
+    """Largest axis-aligned rectangle that fits inside a w×h image after rotating by angle_rad."""
+    sin_a = abs(math.sin(angle_rad))
+    cos_a = abs(math.cos(angle_rad))
+    if sin_a < 1e-10:
+        return w, h
+    width_is_longer = w >= h
+    side_long, side_short = (w, h) if width_is_longer else (h, w)
+    if side_short <= 2.0 * sin_a * cos_a * side_long:
+        x = 0.5 * side_short
+        rw = x / sin_a if width_is_longer else x / cos_a
+        rh = x / cos_a if width_is_longer else x / sin_a
+    else:
+        cos_2a = cos_a * cos_a - sin_a * sin_a
+        rw = (w * cos_a - h * sin_a) / cos_2a
+        rh = (h * cos_a - w * sin_a) / cos_2a
+    return max(1, int(rw)), max(1, int(rh))
+
+
+def get_fix_hints(img: Image.Image, blur_score: float, skew_angle: float = 0.0) -> list[str]:
     hints = []
     try:
         small = img.convert("RGB").resize((256, 256), Image.LANCZOS)
@@ -206,12 +278,16 @@ def get_fix_hints(img: Image.Image, blur_score: float) -> list[str]:
             hints.append("color cast")
     except Exception:
         pass
+    if abs(skew_angle) >= 0.5:
+        sign = "+" if skew_angle > 0 else ""
+        hints.append(f"skew {sign}{skew_angle:.1f}°")
     if 0 <= blur_score < 500:
         hints.append("sharpen")
     return hints
 
 
-def apply_fixes(img: Image.Image, blur_score: float, strength: int = 3) -> Image.Image:
+def apply_fixes(img: Image.Image, blur_score: float,
+                strength: int = 3, skew_angle: float = 0.0) -> Image.Image:
     # strength 1-5 maps to progressively more aggressive corrections
     cutoff   = {1: 0, 2: 1, 3: 2, 4: 5, 5: 10}[strength]
     s_pct    = {1: 60, 2: 90, 3: 130, 4: 170, 5: 220}[strength]
@@ -219,6 +295,23 @@ def apply_fixes(img: Image.Image, blur_score: float, strength: int = 3) -> Image
     img = ImageOps.autocontrast(img.convert("RGB"), cutoff=cutoff)
     if 0 <= blur_score < 500:
         img = img.filter(ImageFilter.UnsharpMask(radius=s_radius, percent=s_pct, threshold=3))
+
+    if abs(skew_angle) >= 0.5:
+        orig_w, orig_h = img.size
+        # Rotate to straighten (positive angle = CCW in PIL, corrects CW tilt)
+        rotated = img.rotate(skew_angle, expand=True, resample=Image.BICUBIC)
+        rw, rh = rotated.size
+        cw, ch = _largest_inscribed_rect(orig_w, orig_h, math.radians(abs(skew_angle)))
+        x1 = (rw - cw) // 2
+        y1 = (rh - ch) // 2
+        x2 = x1 + cw
+        y2 = y1 + ch
+        # Darken corners to show the crop boundary
+        arr = np.array(rotated, dtype=np.float32)
+        out = arr * 0.30                      # dark corners
+        out[y1:y2, x1:x2] = arr[y1:y2, x1:x2]  # restore kept area at full brightness
+        img = Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
     return img
 
 
@@ -351,11 +444,13 @@ def analyze(path: str, folder: str) -> dict:
     jpeg_companion = find_jpeg_companion(path) if is_raw(path) else ""
 
     fix_hints: list[str] = []
+    skew_angle: float = 0.0
     try:
         img = open_as_pil(path)
         img = ImageOps.exif_transpose(img)
         w, h = img.size
-        fix_hints = get_fix_hints(img, score)
+        skew_angle, _skew_conf = detect_skew(img)
+        fix_hints = get_fix_hints(img, score, skew_angle)
     except Exception:
         w, h = 0, 0
 
@@ -389,6 +484,7 @@ def analyze(path: str, folder: str) -> dict:
         "raw_name": Path(raw_companion).name if raw_companion else "",
         "jpeg_companion": jpeg_companion,
         "jpeg_name": Path(jpeg_companion).name if jpeg_companion else "",
+        "skew_angle": skew_angle,
         "fix_hints": fix_hints,
         "cross_folder_duplicates": cross_dupes,
     }
@@ -636,8 +732,12 @@ def get_fix_preview(path: str, folder: str, strength: int = 3):
     if cache_key in fix_preview_cache:
         return StreamingResponse(io.BytesIO(fix_preview_cache[cache_key]), media_type="image/jpeg")
     blur_score = -1.0
+    skew_angle = 0.0
+    need_skew = True
     if path in analysis_cache:
         blur_score = analysis_cache[path].get("blur_score", -1.0)
+        skew_angle = analysis_cache[path].get("skew_angle", 0.0)
+        need_skew = False
     else:
         with get_db() as conn:
             row = conn.execute("SELECT blur_score FROM photos WHERE path=?", (path,)).fetchone()
@@ -646,7 +746,9 @@ def get_fix_preview(path: str, folder: str, strength: int = 3):
     try:
         img = open_as_pil(path)
         img = ImageOps.exif_transpose(img)
-        img = apply_fixes(img, blur_score, strength)
+        if need_skew:
+            skew_angle, _ = detect_skew(img)
+        img = apply_fixes(img, blur_score, strength, skew_angle)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=88)
         jpeg_bytes = buf.getvalue()
