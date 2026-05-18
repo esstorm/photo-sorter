@@ -50,7 +50,7 @@ THUMB_SIZE = 300  # px on longest edge
 # In-memory caches keyed by absolute path
 analysis_cache: dict = {}
 raw_preview_cache: dict[str, bytes] = {}  # RAW path -> JPEG bytes
-fix_preview_cache: dict[str, bytes] = {}  # path -> corrected JPEG bytes
+fix_preview_cache: dict[tuple[str, int], bytes] = {}  # (path, strength) -> corrected JPEG bytes
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -211,10 +211,14 @@ def get_fix_hints(img: Image.Image, blur_score: float) -> list[str]:
     return hints
 
 
-def apply_fixes(img: Image.Image, blur_score: float) -> Image.Image:
-    img = ImageOps.autocontrast(img.convert("RGB"), cutoff=1)
+def apply_fixes(img: Image.Image, blur_score: float, strength: int = 3) -> Image.Image:
+    # strength 1-5 maps to progressively more aggressive corrections
+    cutoff   = {1: 0, 2: 1, 3: 2, 4: 5, 5: 10}[strength]
+    s_pct    = {1: 60, 2: 90, 3: 130, 4: 170, 5: 220}[strength]
+    s_radius = {1: 1.0, 2: 1.2, 3: 1.5, 4: 1.8, 5: 2.0}[strength]
+    img = ImageOps.autocontrast(img.convert("RGB"), cutoff=cutoff)
     if 0 <= blur_score < 500:
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=130, threshold=3))
+        img = img.filter(ImageFilter.UnsharpMask(radius=s_radius, percent=s_pct, threshold=3))
     return img
 
 
@@ -615,19 +619,22 @@ def rotate_photo(req: RotateReq):
         raise HTTPException(500, f"Could not rotate: {e}")
     analysis_cache.pop(req.path, None)
     raw_preview_cache.pop(req.path, None)
-    fix_preview_cache.pop(req.path, None)
+    for k in [k for k in fix_preview_cache if k[0] == req.path]:
+        del fix_preview_cache[k]
     thumb_path(req.path).unlink(missing_ok=True)
     return {"ok": True}
 
 
 @app.get("/api/fix_preview")
-def get_fix_preview(path: str, folder: str):
+def get_fix_preview(path: str, folder: str, strength: int = 3):
+    strength = max(1, min(5, strength))
     folder = require_valid_folder(folder)
     validate_path(path, folder)
     if not os.path.isfile(path):
         raise HTTPException(404, "Not found")
-    if path in fix_preview_cache:
-        return StreamingResponse(io.BytesIO(fix_preview_cache[path]), media_type="image/jpeg")
+    cache_key = (path, strength)
+    if cache_key in fix_preview_cache:
+        return StreamingResponse(io.BytesIO(fix_preview_cache[cache_key]), media_type="image/jpeg")
     blur_score = -1.0
     if path in analysis_cache:
         blur_score = analysis_cache[path].get("blur_score", -1.0)
@@ -639,11 +646,11 @@ def get_fix_preview(path: str, folder: str):
     try:
         img = open_as_pil(path)
         img = ImageOps.exif_transpose(img)
-        img = apply_fixes(img, blur_score)
+        img = apply_fixes(img, blur_score, strength)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=88)
         jpeg_bytes = buf.getvalue()
-        fix_preview_cache[path] = jpeg_bytes
+        fix_preview_cache[cache_key] = jpeg_bytes
         return StreamingResponse(io.BytesIO(jpeg_bytes), media_type="image/jpeg")
     except Exception as e:
         raise HTTPException(500, f"Could not generate fixed preview: {e}")

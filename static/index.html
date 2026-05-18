@@ -266,9 +266,9 @@
 
         <template x-if="currentPhoto">
           <img :src="showFixPreview
-                 ? `/api/fix_preview?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}`
+                 ? `/api/fix_preview?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}&strength=${fixStrength}`
                  : `/api/image?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}&_=${imageRefreshKey}`"
-               :key="currentPhoto.path + showFixPreview + imageRefreshKey"
+               :key="currentPhoto.path + showFixPreview + fixStrength + imageRefreshKey"
                class="max-h-full max-w-full object-contain img-fade select-none"
                :class="zoom > 1 ? (_isPanning ? 'cursor-grabbing' : 'cursor-grab') : ''"
                :style="`max-height:calc(100vh - 148px);
@@ -348,9 +348,16 @@
             </div>
 
             <!-- Quick Fix -->
-            <div class="bg-slate-800/40 rounded-xl p-3 space-y-2">
+            <div class="bg-slate-800/40 rounded-xl p-3 space-y-2.5">
               <div class="flex items-center justify-between">
-                <p class="text-xs text-slate-500 uppercase tracking-wider font-semibold">Quick Fix</p>
+                <div class="flex items-center gap-2">
+                  <p class="text-xs text-slate-500 uppercase tracking-wider font-semibold">Quick Fix</p>
+                  <div x-show="currentPhoto.fix_hints && currentPhoto.fix_hints.length > 0" class="flex flex-wrap gap-1">
+                    <template x-for="hint in (currentPhoto.fix_hints || [])" :key="hint">
+                      <span class="text-[10px] bg-violet-900/60 text-violet-300 px-1.5 py-0.5 rounded-full font-medium" x-text="hint"></span>
+                    </template>
+                  </div>
+                </div>
                 <button @click="toggleFixPreview()"
                         :class="showFixPreview ? 'bg-violet-600 hover:bg-violet-500 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'"
                         class="flex-shrink-0 flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg transition-colors font-medium">
@@ -358,13 +365,15 @@
                   <span x-text="showFixPreview ? 'Original' : 'Preview'"></span>
                 </button>
               </div>
-              <div x-show="currentPhoto.fix_hints && currentPhoto.fix_hints.length > 0" class="flex flex-wrap gap-1">
-                <template x-for="hint in (currentPhoto.fix_hints || [])" :key="hint">
-                  <span class="text-[10px] bg-violet-900/60 text-violet-300 px-2 py-0.5 rounded-full font-medium" x-text="hint"></span>
-                </template>
+              <div>
+                <input type="range" min="1" max="5" step="1" x-model.number="fixStrength"
+                       class="w-full h-1 accent-violet-500 cursor-pointer" />
+                <div class="flex justify-between text-[10px] text-slate-600 mt-1">
+                  <span>Gentle</span>
+                  <span class="text-violet-400/70 font-mono" x-text="fixStrength + '/5'"></span>
+                  <span>Aggressive</span>
+                </div>
               </div>
-              <p x-show="!currentPhoto.fix_hints || currentPhoto.fix_hints.length === 0"
-                 class="text-xs text-slate-600">No specific issues detected</p>
             </div>
 
             <div class="grid grid-cols-2 gap-4">
@@ -856,6 +865,7 @@
       exporting: false,
       exportedPath: '',
       showFixPreview: false,
+      fixStrength: 3,
 
       zoom: 1,
       panX: 0,
