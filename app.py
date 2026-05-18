@@ -262,7 +262,99 @@ def _largest_inscribed_rect(w: int, h: int, angle_rad: float) -> tuple[int, int]
     return max(1, int(rw)), max(1, int(rh))
 
 
-def get_fix_hints(img: Image.Image, blur_score: float, skew_angle: float = 0.0) -> list[str]:
+def detect_keystone(img: Image.Image) -> tuple[float, float]:
+    """Detect vertical keystone distortion (converging verticals).
+    Returns (correction_fraction, confidence).
+    correction_fraction > 0: camera tilted up (top compressed, needs expanding).
+    correction_fraction < 0: camera tilted down (bottom compressed).
+    Fraction is relative to image width; capped at ±0.20.
+    Only fires when near-vertical lines on both halves agree strongly."""
+    if not _CV2_AVAILABLE:
+        return 0.0, 0.0
+    try:
+        small = img.copy()
+        small.thumbnail((800, 800), Image.LANCZOS)
+        W, H = small.size
+        gray = np.array(small.convert("L"))
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                                 threshold=80, minLineLength=H // 5, maxLineGap=10)
+        if lines is None:
+            return 0.0, 0.0
+
+        # Collect near-vertical lines as (slope dx/dy, x at image centre-height)
+        v_lines: list[tuple[float, float]] = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dy = y2 - y1
+            if abs(dy) < 10:
+                continue
+            dx = x2 - x1
+            if math.degrees(math.atan2(abs(dx), abs(dy))) > 20:
+                continue
+            slope = dx / dy
+            x_at_center = x1 + slope * (H / 2 - y1)
+            v_lines.append((slope, x_at_center))
+
+        if len(v_lines) < 10:
+            return 0.0, 0.0
+
+        left  = [(s, x) for s, x in v_lines if x < W * 0.45]
+        right = [(s, x) for s, x in v_lines if x > W * 0.55]
+        if len(left) < 4 or len(right) < 4:
+            return 0.0, 0.0
+
+        left_slope  = float(np.median([s for s, _ in left]))
+        right_slope = float(np.median([s for s, _ in right]))
+
+        # Camera tilted up → left slope < 0, right slope > 0 → convergence < 0
+        convergence = left_slope - right_slope
+        if abs(convergence) < 0.08:
+            return 0.0, 0.0
+
+        # Vanishing point distance from image centre (negative = above image)
+        vp_dist = (W / 2) / convergence
+        if abs(vp_dist) < H * 0.5 or abs(vp_dist) > H * 3.5:
+            return 0.0, 0.0
+
+        # Negate: convergence < 0 (camera up) → positive correction_frac (expand top)
+        raw_frac = -convergence * H / (2 * W)
+        correction_frac = max(-0.20, min(0.20, raw_frac))
+
+        all_slopes = [s for s, _ in v_lines]
+        consistency = max(0.0, 1.0 - float(np.std(all_slopes)) / 0.25)
+        confidence  = min(1.0, len(v_lines) / 20.0) * consistency
+        if confidence < 0.30:
+            return 0.0, 0.0
+
+        return round(float(correction_frac), 3), round(float(confidence), 2)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _apply_keystone(img: Image.Image, correction_frac: float) -> Image.Image:
+    """Apply vertical keystone correction via perspective warp."""
+    if not _CV2_AVAILABLE or abs(correction_frac) < 0.01:
+        return img
+    W, H = img.size
+    arr = np.array(img, dtype=np.uint8)
+    delta = int(abs(correction_frac) * W)
+
+    if correction_frac > 0:
+        # Top compressed → map source trapezoid (narrow top) to full rectangle
+        src_pts = np.float32([[delta, 0], [W - delta, 0], [W, H], [0, H]])
+    else:
+        # Bottom compressed → map source trapezoid (narrow bottom) to full rectangle
+        src_pts = np.float32([[0, 0], [W, 0], [W - delta, H], [delta, H]])
+    dst_pts = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
+
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    corrected = cv2.warpPerspective(arr, M, (W, H), flags=cv2.INTER_LINEAR)
+    return Image.fromarray(corrected)
+
+
+def get_fix_hints(img: Image.Image, blur_score: float, skew_angle: float = 0.0,
+                  keystone_frac: float = 0.0) -> list[str]:
     hints = []
     try:
         small = img.convert("RGB").resize((256, 256), Image.LANCZOS)
@@ -281,13 +373,17 @@ def get_fix_hints(img: Image.Image, blur_score: float, skew_angle: float = 0.0) 
     if abs(skew_angle) >= 0.5:
         sign = "+" if skew_angle > 0 else ""
         hints.append(f"skew {sign}{skew_angle:.1f}°")
+    if abs(keystone_frac) >= 0.01:
+        pct = int(round(abs(keystone_frac) * 100))
+        hints.append(f"keystone {'up' if keystone_frac > 0 else 'down'} {pct}%")
     if 0 <= blur_score < 500:
         hints.append("sharpen")
     return hints
 
 
 def apply_fixes(img: Image.Image, blur_score: float,
-                strength: int = 3, skew_angle: float = 0.0) -> Image.Image:
+                strength: int = 3, skew_angle: float = 0.0,
+                keystone_frac: float = 0.0) -> Image.Image:
     # strength 1-5 maps to progressively more aggressive corrections
     cutoff   = {1: 0, 2: 1, 3: 2, 4: 5, 5: 10}[strength]
     s_pct    = {1: 60, 2: 90, 3: 130, 4: 170, 5: 220}[strength]
@@ -311,6 +407,9 @@ def apply_fixes(img: Image.Image, blur_score: float,
         out = arr * 0.30                      # dark corners
         out[y1:y2, x1:x2] = arr[y1:y2, x1:x2]  # restore kept area at full brightness
         img = Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+    if abs(keystone_frac) >= 0.01:
+        img = _apply_keystone(img, keystone_frac)
 
     return img
 
@@ -445,12 +544,14 @@ def analyze(path: str, folder: str) -> dict:
 
     fix_hints: list[str] = []
     skew_angle: float = 0.0
+    keystone_frac: float = 0.0
     try:
         img = open_as_pil(path)
         img = ImageOps.exif_transpose(img)
         w, h = img.size
         skew_angle, _skew_conf = detect_skew(img)
-        fix_hints = get_fix_hints(img, score, skew_angle)
+        keystone_frac, _ks_conf = detect_keystone(img)
+        fix_hints = get_fix_hints(img, score, skew_angle, keystone_frac)
     except Exception:
         w, h = 0, 0
 
@@ -485,6 +586,7 @@ def analyze(path: str, folder: str) -> dict:
         "jpeg_companion": jpeg_companion,
         "jpeg_name": Path(jpeg_companion).name if jpeg_companion else "",
         "skew_angle": skew_angle,
+        "keystone_frac": keystone_frac,
         "fix_hints": fix_hints,
         "cross_folder_duplicates": cross_dupes,
     }
@@ -733,11 +835,13 @@ def get_fix_preview(path: str, folder: str, strength: int = 3):
         return StreamingResponse(io.BytesIO(fix_preview_cache[cache_key]), media_type="image/jpeg")
     blur_score = -1.0
     skew_angle = 0.0
-    need_skew = True
+    keystone_frac = 0.0
+    need_detect = True
     if path in analysis_cache:
         blur_score = analysis_cache[path].get("blur_score", -1.0)
         skew_angle = analysis_cache[path].get("skew_angle", 0.0)
-        need_skew = False
+        keystone_frac = analysis_cache[path].get("keystone_frac", 0.0)
+        need_detect = False
     else:
         with get_db() as conn:
             row = conn.execute("SELECT blur_score FROM photos WHERE path=?", (path,)).fetchone()
@@ -746,9 +850,10 @@ def get_fix_preview(path: str, folder: str, strength: int = 3):
     try:
         img = open_as_pil(path)
         img = ImageOps.exif_transpose(img)
-        if need_skew:
+        if need_detect:
             skew_angle, _ = detect_skew(img)
-        img = apply_fixes(img, blur_score, strength, skew_angle)
+            keystone_frac, _ = detect_keystone(img)
+        img = apply_fixes(img, blur_score, strength, skew_angle, keystone_frac)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=88)
         jpeg_bytes = buf.getvalue()
