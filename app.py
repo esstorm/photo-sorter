@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -196,6 +197,31 @@ def find_raw_companion(path: str) -> str:
     return ""
 
 
+def find_jpeg_companion(path: str) -> str:
+    """Return the path of a JPEG with the same stem as this RAW, if one exists."""
+    p = Path(path)
+    for ext in (".jpg", ".JPG", ".jpeg", ".JPEG"):
+        candidate = p.with_suffix(ext)
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
+def export_raw_to_jpeg(raw_path: str) -> bytes:
+    """Convert a RAW file to JPEG bytes. Uses the embedded JPEG thumbnail when available
+    (preserves original EXIF and quality); falls back to full postprocess."""
+    with rawpy.imread(raw_path) as raw:
+        thumb = raw.extract_thumb()
+        if thumb.format == rawpy.ThumbFormat.JPEG:
+            return bytes(thumb.data)
+        rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)
+    img = Image.fromarray(rgb)
+    img = ImageOps.exif_transpose(img)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
 def compute_dhash(path: str) -> str:
     try:
         img = open_as_pil(path).convert("L").resize((9, 8), Image.LANCZOS)
@@ -288,6 +314,7 @@ def analyze(path: str, folder: str) -> dict:
     dhash = compute_dhash(path)
     file_hash = compute_file_hash(path)
     raw_companion = find_raw_companion(path)
+    jpeg_companion = find_jpeg_companion(path) if is_raw(path) else ""
 
     try:
         img = open_as_pil(path)
@@ -320,8 +347,11 @@ def analyze(path: str, folder: str) -> dict:
         "file_hash": file_hash,
         "dhash": dhash,
         "exif": exif,
+        "is_raw": is_raw(path),
         "raw_companion": raw_companion,
         "raw_name": Path(raw_companion).name if raw_companion else "",
+        "jpeg_companion": jpeg_companion,
+        "jpeg_name": Path(jpeg_companion).name if jpeg_companion else "",
         "cross_folder_duplicates": cross_dupes,
     }
     analysis_cache[path] = result
@@ -416,6 +446,11 @@ class RotateReq(BaseModel):
 class PrefetchReq(BaseModel):
     folder: str
     paths: list[str]
+
+
+class ExportReq(BaseModel):
+    folder: str
+    path: str
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -547,6 +582,39 @@ def rotate_photo(req: RotateReq):
     analysis_cache.pop(req.path, None)
     raw_preview_cache.pop(req.path, None)
     thumb_path(req.path).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/api/export")
+def export_jpeg(req: ExportReq):
+    folder = require_valid_folder(req.folder)
+    validate_path(req.path, folder)
+    if not is_raw(req.path):
+        raise HTTPException(400, "Not a RAW file")
+    if not os.path.isfile(req.path):
+        raise HTTPException(404, "Not found")
+    existing = find_jpeg_companion(req.path)
+    if existing:
+        return {"jpeg_path": existing, "converted": False}
+    jpeg_path = Path(req.path).with_suffix(".jpg")
+    try:
+        jpeg_path.write_bytes(export_raw_to_jpeg(req.path))
+    except Exception as e:
+        raise HTTPException(500, f"Could not convert: {e}")
+    analysis_cache.pop(req.path, None)
+    return {"jpeg_path": str(jpeg_path), "converted": True}
+
+
+@app.get("/api/reveal")
+def reveal_in_finder(path: str, folder: str):
+    folder = require_valid_folder(folder)
+    validate_path(path, folder)
+    if not os.path.exists(path):
+        raise HTTPException(404, "Not found")
+    try:
+        subprocess.run(["open", "-R", path], check=True, timeout=5)
+    except Exception as e:
+        raise HTTPException(500, f"Could not reveal: {e}")
     return {"ok": True}
 
 

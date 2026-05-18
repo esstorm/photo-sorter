@@ -192,13 +192,24 @@
       </div>
 
       <div class="flex items-center gap-2">
-        <button @click="showGroups()" class="text-sm bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors text-slate-300 flex items-center gap-1.5">
-          <span x-show="groupsLoading" class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></span>
-          <span x-show="!groupsLoading && groups.length > 0" class="text-violet-400 font-semibold" x-text="groups.length"></span>
-          Groups
-        </button>
-        <button @click="screen='gallery'; galleryFilter=null" class="text-sm bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors text-slate-300">Gallery</button>
-        <button @click="showStats()" class="text-sm bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors text-slate-300">Stats</button>
+        <div class="flex items-center bg-slate-800 rounded-lg p-0.5">
+          <button @click="viewMode='sort'"
+                  class="text-xs px-2.5 py-1 rounded-md font-medium transition-colors"
+                  :class="viewMode==='sort' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white'">Sort</button>
+          <button @click="viewMode='gallery'"
+                  class="text-xs px-2.5 py-1 rounded-md font-medium transition-colors"
+                  :class="viewMode==='gallery' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white'">Gallery</button>
+          <button @click="setViewMode('groups')"
+                  class="text-xs px-2.5 py-1 rounded-md font-medium transition-colors flex items-center gap-1"
+                  :class="viewMode==='groups' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white'">
+            <span x-show="groupsLoading" class="w-2.5 h-2.5 border border-current border-t-transparent rounded-full animate-spin"></span>
+            <span x-show="!groupsLoading && groups.length > 0" class="text-violet-400 font-bold text-[10px]" x-text="groups.length"></span>
+            Groups
+          </button>
+          <button @click="setViewMode('stats')"
+                  class="text-xs px-2.5 py-1 rounded-md font-medium transition-colors"
+                  :class="viewMode==='stats' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white'">Stats</button>
+        </div>
         <button @click="openReview()" class="text-sm bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors text-slate-300">Review →</button>
       </div>
     </div>
@@ -218,7 +229,7 @@
     </div>
 
     <!-- Main body -->
-    <div class="flex flex-1 min-h-0">
+    <div x-show="viewMode === 'sort'" class="flex flex-1 min-h-0">
 
       <!-- Image area -->
       <div class="relative flex-1 flex items-center justify-center bg-slate-950 vignette min-w-0 overflow-hidden"
@@ -273,7 +284,35 @@
             <div>
               <p class="lbl">File</p>
               <p class="text-sm text-white font-mono break-all leading-snug" x-text="currentPhoto.name"></p>
+              <button @click="revealInFinder(currentPhoto.path)"
+                      class="mt-1.5 text-xs text-slate-500 hover:text-blue-400 transition-colors flex items-center gap-1">
+                ↗ Show in Finder
+              </button>
             </div>
+
+            <!-- JPEG export / reveal (RAW files only) -->
+            <template x-if="currentPhoto.is_raw">
+              <div>
+                <p class="lbl">JPEG</p>
+                <template x-if="!currentPhoto.jpeg_companion && !exportedPath">
+                  <button @click="exportJpeg()" :disabled="exporting"
+                          class="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-semibold py-2 rounded-xl border border-slate-700/60 transition-colors">
+                    <span x-show="exporting" class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin flex-shrink-0"></span>
+                    <span x-text="exporting ? 'Converting…' : 'Export to JPEG'"></span>
+                  </button>
+                </template>
+                <template x-if="currentPhoto.jpeg_companion || exportedPath">
+                  <div>
+                    <p class="text-sm text-white font-mono break-all leading-snug"
+                       x-text="(exportedPath || currentPhoto.jpeg_companion).split('/').pop()"></p>
+                    <button @click="revealInFinder(exportedPath || currentPhoto.jpeg_companion)"
+                            class="mt-1.5 text-xs text-slate-500 hover:text-blue-400 transition-colors flex items-center gap-1">
+                      ↗ Show in Finder
+                    </button>
+                  </div>
+                </template>
+              </div>
+            </template>
 
             <div>
               <div class="flex items-center justify-between mb-1.5">
@@ -345,6 +384,10 @@
                   <p class="text-orange-200 text-xs font-semibold">Companion file</p>
                 </div>
                 <p class="text-orange-300/70 font-mono text-xs break-all" x-text="currentPhoto.raw_name"></p>
+                <button @click="revealInFinder(currentPhoto.raw_companion)"
+                        class="mt-1.5 text-xs text-orange-400/60 hover:text-blue-400 transition-colors flex items-center gap-1">
+                  ↗ Show in Finder
+                </button>
                 <p class="text-orange-400/50 text-xs mt-1.5 leading-snug">This RAW file will be moved to trash together with the JPEG when deleted.</p>
               </div>
             </template>
@@ -405,8 +448,117 @@
       </div>
     </div>
 
-    <!-- Bottom bar -->
-    <div class="flex items-center justify-center gap-3 px-4 py-2.5 bg-slate-900 border-t border-slate-800 flex-shrink-0">
+    <!-- Gallery view -->
+    <div x-show="viewMode === 'gallery'" class="flex-1 overflow-y-auto p-3"
+         @wheel="handleGalleryZoom($event)">
+      <div x-show="activeList().length === 0" class="flex items-center justify-center h-32 text-slate-600 text-sm">
+        No photos in this category
+      </div>
+      <div class="grid gap-1.5" :style="`grid-template-columns: repeat(auto-fill, minmax(${galleryTileSize}px, 1fr))`">
+        <template x-for="path in activeList()" :key="path">
+          <div class="relative cursor-pointer group aspect-square rounded-lg overflow-hidden bg-slate-800"
+               @click="viewMode='sort'; goToPath(path)">
+            <img :src="`/api/thumbnail?path=${enc(path)}&folder=${enc(currentFolder)}`"
+                 class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+                 loading="lazy" />
+            <div x-show="classifications[path]" class="absolute inset-0 opacity-25 pointer-events-none"
+                 :class="overlayClass(classifications[path])"></div>
+            <div x-show="classifications[path]"
+                 class="absolute top-1 left-1 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase leading-none"
+                 :class="badgeClass(classifications[path])" x-text="classifications[path]"></div>
+            <div class="absolute inset-0 ring-2 ring-inset ring-transparent group-hover:ring-blue-400 rounded-lg transition-all pointer-events-none"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Groups view -->
+    <div x-show="viewMode === 'groups'" class="flex-1 overflow-y-auto">
+      <div x-show="groupsLoading" class="flex items-center justify-center h-full py-20">
+        <div class="text-center space-y-3">
+          <div class="w-8 h-8 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+          <p class="text-slate-500 text-sm">Computing similarity index…</p>
+          <p class="text-slate-600 text-xs">Results cached in folder database.</p>
+        </div>
+      </div>
+      <div x-show="!groupsLoading && groups.length === 0" class="flex items-center justify-center h-full py-20">
+        <div class="text-center">
+          <p class="text-slate-400 text-sm font-medium">No similar groups found</p>
+          <p class="text-slate-600 text-xs mt-1">All photos look visually distinct.</p>
+        </div>
+      </div>
+      <div x-show="!groupsLoading && groups.length > 0" class="p-6 space-y-4">
+        <template x-for="(group, gi) in groups" :key="gi">
+          <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-xs text-slate-500 font-medium"><span x-text="group.length"></span> similar photos</span>
+              <div class="flex items-center gap-1.5">
+                <span class="text-xs text-slate-600 mr-1">All:</span>
+                <button @click="classifyGroup(group,'favorite')" class="text-amber-400 hover:bg-amber-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-amber-800/30">★</button>
+                <button @click="classifyGroup(group,'keep')"     class="text-green-400 hover:bg-green-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-green-800/30">♥</button>
+                <button @click="classifyGroup(group,'unsure')"   class="text-yellow-400 hover:bg-yellow-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-yellow-800/30">?</button>
+                <button @click="classifyGroup(group,'delete')"   class="text-red-400 hover:bg-red-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-red-800/30">✕</button>
+              </div>
+            </div>
+            <div class="flex gap-2 overflow-x-auto pb-1">
+              <template x-for="member in group" :key="member.path">
+                <div class="relative flex-shrink-0 cursor-pointer group" @click="jumpTo(member.path)" style="width:140px">
+                  <img :src="`/api/thumbnail?path=${enc(member.path)}&folder=${enc(currentFolder)}`"
+                       class="w-full h-24 object-cover rounded-xl bg-slate-800 group-hover:ring-2 ring-violet-500 transition-all" />
+                  <div x-show="classifications[member.path]" class="absolute inset-0 rounded-xl opacity-40"
+                       :class="overlayClass(classifications[member.path])"></div>
+                  <div x-show="classifications[member.path]"
+                       class="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md text-xs font-bold uppercase"
+                       :class="badgeClass(classifications[member.path])" x-text="classifications[member.path]"></div>
+                  <p class="text-xs text-slate-500 mt-1 truncate" x-text="member.path.split('/').pop()"></p>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Stats view -->
+    <div x-show="viewMode === 'stats'" class="flex-1 overflow-y-auto">
+      <div x-show="statsLoading" class="flex items-center justify-center h-full py-20">
+        <div class="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+      </div>
+      <template x-if="stats && !statsLoading">
+        <p class="text-xs text-slate-500 px-6 pt-4">
+          <span x-text="stats.matched"></span><span x-show="activeFilter"> of <span x-text="stats.total"></span></span>
+          photo<span x-show="stats.matched !== 1">s</span> · <span x-text="stats.with_exif"></span> with exposure data
+        </p>
+      </template>
+      <div x-show="!statsLoading && stats && stats.matched === 0" class="flex items-center justify-center py-20">
+        <p class="text-slate-600 text-sm">No photos in this category yet.</p>
+      </div>
+      <div x-show="!statsLoading && stats && stats.matched > 0" class="p-6">
+        <div class="grid grid-cols-2 gap-5 max-w-4xl mx-auto">
+          <template x-for="section in statSections()" :key="section.title">
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+              <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4" x-text="section.title"></h3>
+              <div x-show="section.items.length === 0" class="text-slate-600 text-sm py-2">No data — browse some photos first so EXIF is indexed.</div>
+              <div class="space-y-2">
+                <template x-for="item in section.items" :key="item.label">
+                  <div class="flex items-center gap-2">
+                    <span class="text-xs text-slate-400 font-mono w-16 flex-shrink-0 text-right" x-text="item.label"></span>
+                    <div class="flex-1 bg-slate-800 rounded-full h-4 overflow-hidden">
+                      <div class="h-4 rounded-full" :class="section.color"
+                           :style="`width: ${item.count / section.max * 100}%`"></div>
+                    </div>
+                    <span class="text-xs text-slate-500 font-mono w-7 flex-shrink-0 text-right" x-text="item.count"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom bar (sort mode only) -->
+    <div x-show="viewMode === 'sort'" class="flex items-center justify-center gap-3 px-4 py-2.5 bg-slate-900 border-t border-slate-800 flex-shrink-0">
       <button @click="navigate(-1)" class="flex items-center gap-1 text-slate-400 hover:text-white text-sm transition-colors px-2 py-1.5">
         <kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono text-xs">←</kbd> Prev
       </button>
@@ -429,181 +581,6 @@
               :class="photoRotation ? 'text-blue-400' : ''">
         <kbd class="bg-slate-800 px-1.5 py-0.5 rounded font-mono text-xs">R</kbd> Rotate
       </button>
-    </div>
-  </div>
-
-  <!-- ══════════════════════════════════════════════ GROUPS -->
-  <div x-show="screen === 'groups'" class="h-screen flex flex-col overflow-hidden">
-    <div class="flex items-center gap-3 px-4 py-3 bg-slate-900 border-b border-slate-800 flex-shrink-0">
-      <button @click="openMenu()" class="text-slate-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-slate-800">
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
-        </svg>
-      </button>
-      <button @click="screen='sorting'" class="text-slate-400 hover:text-white text-sm transition-colors">← Back</button>
-      <h2 class="text-sm font-semibold text-white">Similar Photo Groups</h2>
-      <span x-show="!groupsLoading" class="text-xs text-slate-500"><span x-text="groups.length"></span> group<span x-show="groups.length !== 1">s</span></span>
-    </div>
-
-    <div x-show="groupsLoading" class="flex-1 flex items-center justify-center">
-      <div class="text-center space-y-3">
-        <div class="w-8 h-8 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
-        <p class="text-slate-500 text-sm">Computing similarity index…</p>
-        <p class="text-slate-600 text-xs">Results cached in folder database.</p>
-      </div>
-    </div>
-
-    <div x-show="!groupsLoading && groups.length === 0" class="flex-1 flex items-center justify-center">
-      <div class="text-center">
-        <p class="text-slate-400 text-sm font-medium">No similar groups found</p>
-        <p class="text-slate-600 text-xs mt-1">All photos look visually distinct.</p>
-      </div>
-    </div>
-
-    <div x-show="!groupsLoading && groups.length > 0" class="flex-1 overflow-y-auto p-6 space-y-4">
-      <template x-for="(group, gi) in groups" :key="gi">
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
-          <div class="flex items-center justify-between mb-3">
-            <span class="text-xs text-slate-500 font-medium"><span x-text="group.length"></span> similar photos</span>
-            <div class="flex items-center gap-1.5">
-              <span class="text-xs text-slate-600 mr-1">All:</span>
-              <button @click="classifyGroup(group,'favorite')" class="text-amber-400 hover:bg-amber-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-amber-800/30">★</button>
-              <button @click="classifyGroup(group,'keep')"     class="text-green-400 hover:bg-green-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-green-800/30">♥</button>
-              <button @click="classifyGroup(group,'unsure')"   class="text-yellow-400 hover:bg-yellow-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-yellow-800/30">?</button>
-              <button @click="classifyGroup(group,'delete')"   class="text-red-400 hover:bg-red-900/40 text-xs px-2 py-1 rounded-lg transition-colors border border-red-800/30">✕</button>
-            </div>
-          </div>
-          <div class="flex gap-2 overflow-x-auto pb-1">
-            <template x-for="member in group" :key="member.path">
-              <div class="relative flex-shrink-0 cursor-pointer group" @click="jumpTo(member.path)" style="width:140px">
-                <img :src="`/api/thumbnail?path=${enc(member.path)}&folder=${enc(currentFolder)}`"
-                     class="w-full h-24 object-cover rounded-xl bg-slate-800 group-hover:ring-2 ring-violet-500 transition-all" />
-                <div x-show="classifications[member.path]" class="absolute inset-0 rounded-xl opacity-40"
-                     :class="overlayClass(classifications[member.path])"></div>
-                <div x-show="classifications[member.path]"
-                     class="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md text-xs font-bold uppercase"
-                     :class="badgeClass(classifications[member.path])" x-text="classifications[member.path]"></div>
-                <p class="text-xs text-slate-500 mt-1 truncate" x-text="member.path.split('/').pop()"></p>
-              </div>
-            </template>
-          </div>
-        </div>
-      </template>
-    </div>
-  </div>
-
-  <!-- ══════════════════════════════════════════════ GALLERY -->
-  <div x-show="screen === 'gallery'" class="h-screen flex flex-col overflow-hidden">
-    <div class="flex items-center gap-3 px-4 py-3 bg-slate-900 border-b border-slate-800 flex-shrink-0">
-      <button @click="openMenu()" class="text-slate-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-slate-800">
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
-        </svg>
-      </button>
-      <button @click="screen='sorting'" class="text-slate-400 hover:text-white text-sm transition-colors">← Back</button>
-      <h2 class="text-sm font-semibold text-white">Gallery</h2>
-      <span class="text-xs text-slate-500">
-        <span x-text="galleryList().length"></span> photo<span x-show="galleryList().length !== 1">s</span>
-      </span>
-    </div>
-
-    <div class="flex items-center gap-1.5 px-4 py-2 bg-slate-900 border-b border-slate-800/60 flex-shrink-0 overflow-x-auto">
-      <template x-for="[f, label, cls] in filterOptions()" :key="String(f)">
-        <button @click="galleryFilter = f"
-                class="flex-shrink-0 text-xs px-3 py-1.5 rounded-lg font-medium transition-colors"
-                :class="galleryFilter === f
-                  ? `${cls} ring-1 ring-current`
-                  : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'">
-          <span x-text="label"></span>
-          <span class="ml-1 opacity-60" x-text="'(' + filterCount(f) + ')'"></span>
-        </button>
-      </template>
-    </div>
-
-    <div class="flex-1 overflow-y-auto p-3">
-      <div x-show="galleryList().length === 0" class="flex items-center justify-center h-32 text-slate-600 text-sm">
-        No photos in this category
-      </div>
-      <div class="grid gap-1.5" style="grid-template-columns: repeat(auto-fill, minmax(130px, 1fr))">
-        <template x-for="path in galleryList()" :key="path">
-          <div class="relative cursor-pointer group aspect-square rounded-lg overflow-hidden bg-slate-800"
-               @click="jumpTo(path)">
-            <img :src="`/api/thumbnail?path=${enc(path)}&folder=${enc(currentFolder)}`"
-                 class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
-                 loading="lazy" />
-            <div x-show="classifications[path]" class="absolute inset-0 opacity-25 pointer-events-none"
-                 :class="overlayClass(classifications[path])"></div>
-            <div x-show="classifications[path]"
-                 class="absolute top-1 left-1 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase leading-none"
-                 :class="badgeClass(classifications[path])" x-text="classifications[path]"></div>
-            <div class="absolute inset-0 ring-2 ring-inset ring-transparent group-hover:ring-blue-400 rounded-lg transition-all pointer-events-none"></div>
-          </div>
-        </template>
-      </div>
-    </div>
-  </div>
-
-  <!-- ══════════════════════════════════════════════ STATS -->
-  <div x-show="screen === 'stats'" class="h-screen flex flex-col overflow-hidden">
-    <div class="flex items-center gap-3 px-4 py-3 bg-slate-900 border-b border-slate-800 flex-shrink-0">
-      <button @click="openMenu()" class="text-slate-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-slate-800">
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
-        </svg>
-      </button>
-      <button @click="screen='sorting'" class="text-slate-400 hover:text-white text-sm transition-colors">← Back</button>
-      <h2 class="text-sm font-semibold text-white">Stats</h2>
-      <template x-if="stats && !statsLoading">
-        <span class="text-xs text-slate-500">
-          <span x-text="stats.matched"></span><span x-show="statsFilter"> of <span x-text="stats.total"></span></span> photo<span x-show="stats.matched !== 1">s</span>
-          · <span x-text="stats.with_exif"></span> with exposure data
-        </span>
-      </template>
-    </div>
-
-    <!-- Filter bar -->
-    <div class="flex items-center gap-1.5 px-4 py-2 bg-slate-900 border-b border-slate-800/60 flex-shrink-0 overflow-x-auto">
-      <template x-for="[f, label, cls] in filterOptions()" :key="String(f)">
-        <button @click="setStatsFilter(f)"
-                class="flex-shrink-0 text-xs px-3 py-1.5 rounded-lg font-medium transition-colors"
-                :class="statsFilter === f
-                  ? `${cls} ring-1 ring-current`
-                  : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'">
-          <span x-text="label"></span>
-          <span class="ml-1 opacity-60" x-text="'(' + filterCount(f) + ')'"></span>
-        </button>
-      </template>
-    </div>
-
-    <div x-show="statsLoading" class="flex-1 flex items-center justify-center">
-      <div class="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-    </div>
-
-    <div x-show="!statsLoading && stats && stats.matched === 0" class="flex-1 flex items-center justify-center">
-      <p class="text-slate-600 text-sm">No photos in this category yet.</p>
-    </div>
-
-    <div x-show="!statsLoading && stats && stats.matched > 0" class="flex-1 overflow-y-auto p-6">
-      <div class="grid grid-cols-2 gap-5 max-w-4xl mx-auto">
-        <template x-for="section in statSections()" :key="section.title">
-          <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
-            <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4" x-text="section.title"></h3>
-            <div x-show="section.items.length === 0" class="text-slate-600 text-sm py-2">No data — browse some photos first so EXIF is indexed.</div>
-            <div class="space-y-2">
-              <template x-for="item in section.items" :key="item.label">
-                <div class="flex items-center gap-2">
-                  <span class="text-xs text-slate-400 font-mono w-16 flex-shrink-0 text-right" x-text="item.label"></span>
-                  <div class="flex-1 bg-slate-800 rounded-full h-4 overflow-hidden">
-                    <div class="h-4 rounded-full" :class="section.color"
-                         :style="`width: ${item.count / section.max * 100}%`"></div>
-                  </div>
-                  <span class="text-xs text-slate-500 font-mono w-7 flex-shrink-0 text-right" x-text="item.count"></span>
-                </div>
-              </template>
-            </div>
-          </div>
-        </template>
-      </div>
     </div>
   </div>
 
@@ -830,11 +807,12 @@
       deleteResults: null,
       unsureResults: null,
       executingUnsure: false,
-      galleryFilter: null,
+
+      viewMode: 'sort',
+      galleryTileSize: 130,
 
       stats: null,
       statsLoading: false,
-      statsFilter: null,
       statsCache: {},
 
       menuOpen: false,
@@ -845,6 +823,9 @@
       browserParent: null,
       browserDirs: [],
       browserLoading: false,
+
+      exporting: false,
+      exportedPath: '',
 
       zoom: 1,
       panX: 0,
@@ -904,10 +885,9 @@
           this.currentPhoto = null;
           this.deleteResults = null;
           this.unsureResults = null;
-          this.galleryFilter = null;
           this._prefetchedPaths = {};
+          this.viewMode = 'sort';
           this.stats = null;
-          this.statsFilter = null;
           this.statsCache = {};
 
           // Sync URL
@@ -942,6 +922,7 @@
         this.zoom = 1; this.panX = 0; this.panY = 0;
         this.photoRotation = 0; this.imageRefreshKey = 0;
         this.slideOffset = 0; this.slideAnimate = false;
+        this.exporting = false; this.exportedPath = '';
         await this.loadPhotoData(path);
       },
 
@@ -984,14 +965,19 @@
 
       async jumpTo(path) {
         this.activeFilter = null;
+        this.viewMode = 'sort';
         this.currentPath = path;
         await this.loadPhotoData(path);
-        this.screen = 'sorting';
       },
 
       // ── Filter ────────────────────────────────────────────────────
       setFilter(f) {
         this.activeFilter = f;
+        if (this.viewMode === 'stats') {
+          this.loadStats();
+          return;
+        }
+        if (this.viewMode !== 'sort') return; // gallery/groups update reactively
         const list = this.activeList();
         if (list.length > 0) {
           this.goToPath(list[0]);
@@ -1084,12 +1070,6 @@
         return this.getUnsurePhotos().filter(p => this.companions[p]).length;
       },
 
-      galleryList() {
-        if (!this.galleryFilter) return this.photos;
-        if (this.galleryFilter === 'unclassified') return this.photos.filter(p => !this.classifications[p]);
-        return this.photos.filter(p => this.classifications[p] === this.galleryFilter);
-      },
-
       async executeUnsure() {
         this.executingUnsure = true;
         try {
@@ -1125,6 +1105,21 @@
         }
       },
 
+      async setViewMode(mode) {
+        this.viewMode = mode;
+        if (mode === 'groups' && !this.groupsLoading && this.groups.length === 0) {
+          this.loadGroupsBackground();
+        } else if (mode === 'stats') {
+          await this.loadStats();
+        }
+      },
+
+      handleGalleryZoom(e) {
+        if (!e.ctrlKey) return;
+        e.preventDefault();
+        this.galleryTileSize = Math.max(70, Math.min(320, this.galleryTileSize + (-e.deltaY * 0.4)));
+      },
+
       buildGroupMap() {
         this.groupMap = {};
         for (const group of this.groups) {
@@ -1138,22 +1133,22 @@
       },
 
       showGroups() {
-        this.screen = 'groups';
+        this.viewMode = 'groups';
         if (!this.groupsLoading && this.groups.length === 0) this.loadGroupsBackground();
       },
 
       async showStats() {
-        this.screen = 'stats';
+        this.viewMode = 'stats';
         await this.loadStats();
       },
 
       async loadStats() {
-        const key = this.statsFilter || 'all';
+        const key = this.activeFilter || 'all';
         if (this.statsCache[key]) { this.stats = this.statsCache[key]; return; }
         this.statsLoading = true;
         this.stats = null;
         try {
-          const clf = this.statsFilter ? `&classification=${enc(this.statsFilter)}` : '';
+          const clf = this.activeFilter ? `&classification=${enc(this.activeFilter)}` : '';
           const res = await fetch(`/api/stats?folder=${enc(this.currentFolder)}${clf}`);
           if (res.ok) {
             this.stats = await res.json();
@@ -1162,11 +1157,6 @@
         } finally {
           this.statsLoading = false;
         }
-      },
-
-      async setStatsFilter(f) {
-        this.statsFilter = f;
-        await this.loadStats();
       },
 
       statSections() {
@@ -1329,6 +1319,25 @@
         }
       },
 
+      async exportJpeg() {
+        if (!this.currentPath || this.exporting) return;
+        this.exporting = true;
+        try {
+          const res = await fetch('/api/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: this.currentPath, folder: this.currentFolder }),
+          });
+          if (res.ok) this.exportedPath = (await res.json()).jpeg_path;
+        } finally {
+          this.exporting = false;
+        }
+      },
+
+      revealInFinder(path) {
+        fetch(`/api/reveal?path=${enc(path)}&folder=${enc(this.currentFolder)}`).catch(() => {});
+      },
+
       // ── Keyboard ──────────────────────────────────────────────────
       handleKey(e) {
         if (['INPUT','TEXTAREA'].includes(e.target.tagName)) return;
@@ -1340,17 +1349,13 @@
           else if (k==='u')         { e.preventDefault(); this.classify('unsure'); }
           else if (k==='z')         { e.preventDefault(); this.undo(); }
           else if (k==='r')         { e.preventDefault(); this.rotatePhoto(); }
-          else if (k==='g')         { e.preventDefault(); this.showGroups(); }
-          else if (k==='l')         { e.preventDefault(); this.screen='gallery'; this.galleryFilter=null; }
-          else if (k==='s')         { e.preventDefault(); this.showStats(); }
+          else if (k==='g')         { e.preventDefault(); this.setViewMode('groups'); }
+          else if (k==='l')         { e.preventDefault(); this.viewMode='gallery'; }
+          else if (k==='s')         { e.preventDefault(); this.setViewMode('stats'); }
           else if (e.key==='ArrowLeft')  { e.preventDefault(); this.navigate(-1); }
           else if (e.key==='ArrowRight') { e.preventDefault(); this.navigate(1); }
-        } else if (this.screen==='groups') {
-          if (k==='g'||e.key==='Escape') { e.preventDefault(); this.screen='sorting'; }
-        } else if (this.screen==='gallery') {
-          if (k==='l'||e.key==='Escape') { e.preventDefault(); this.screen='sorting'; }
-        } else if (this.screen==='stats') {
-          if (k==='s'||e.key==='Escape') { e.preventDefault(); this.screen='sorting'; }
+        } else if (['groups','gallery','stats'].includes(this.viewMode) && this.screen==='sorting') {
+          if (e.key==='Escape') { e.preventDefault(); this.viewMode='sort'; }
         }
       },
 
