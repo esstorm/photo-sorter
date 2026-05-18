@@ -721,6 +721,117 @@ def execute_unsure(req: ExecuteReq):
     return {"moved": moved, "raw_moved": raw_moved, "errors": errors, "unsure_dir": str(unsure_dir)}
 
 
+@app.get("/api/stats")
+def get_stats(folder: str, classification: str = ""):
+    folder = require_valid_folder(folder)
+    photos = scan_photos(folder)
+    total = len(photos)
+    empty = {"total": total, "matched": 0, "with_exif": 0,
+             "focal_lengths": [], "apertures": [], "isos": [], "shutter_speeds": []}
+    if not photos:
+        return empty
+
+    placeholders = ",".join("?" * len(photos))
+    with get_db() as conn:
+        if classification == "unclassified":
+            classified = {r["path"] for r in conn.execute(
+                f"SELECT path FROM photos WHERE path IN ({placeholders}) AND classification IS NOT NULL",
+                photos,
+            ).fetchall()}
+            subset = [p for p in photos if p not in classified]
+        elif classification in ("favorite", "keep", "delete", "unsure"):
+            subset = [r["path"] for r in conn.execute(
+                f"SELECT path FROM photos WHERE path IN ({placeholders}) AND classification=?",
+                photos + [classification],
+            ).fetchall()]
+        else:
+            subset = photos
+
+        matched = len(subset)
+        if not subset:
+            return {**empty, "matched": 0}
+
+        sp = ",".join("?" * len(subset))
+        rows = conn.execute(
+            f"SELECT path, exif_json FROM photos WHERE path IN ({sp}) AND exif_json IS NOT NULL",
+            subset,
+        ).fetchall()
+
+    EXPOSURE_KEYS = ("FocalLength", "FNumber", "ISOSpeedRatings", "ExposureTime")
+
+    # Re-read EXIF from disk for photos missing exposure fields — happens when photos were
+    # analyzed before the ExifIFD fix. Update the DB so this only runs once per photo.
+    stale: list[tuple[str, str]] = []
+    refreshed: dict[str, dict] = {}
+    for row in rows:
+        try:
+            exif = json.loads(row["exif_json"])
+        except Exception:
+            continue
+        if not any(exif.get(k) for k in EXPOSURE_KEYS) and os.path.isfile(row["path"]):
+            fresh = get_exif(row["path"])
+            if any(fresh.get(k) for k in EXPOSURE_KEYS):
+                refreshed[row["path"]] = fresh
+                stale.append((json.dumps(fresh), row["path"]))
+
+    if stale:
+        with get_db() as conn:
+            for exif_json, path in stale:
+                conn.execute("UPDATE photos SET exif_json=? WHERE path=?", (exif_json, path))
+
+    focal_lengths: dict[str, int] = {}
+    apertures: dict[str, int] = {}
+    isos: dict[str, int] = {}
+    shutter_speeds: dict[str, int] = {}
+    with_exif = 0
+
+    for row in rows:
+        try:
+            exif = refreshed.get(row["path"]) or json.loads(row["exif_json"])
+        except Exception:
+            continue
+        has = False
+        if v := exif.get("FocalLength"):
+            focal_lengths[v] = focal_lengths.get(v, 0) + 1
+            has = True
+        if v := exif.get("FNumber"):
+            apertures[v] = apertures.get(v, 0) + 1
+            has = True
+        if v := exif.get("ISOSpeedRatings"):
+            isos[v] = isos.get(v, 0) + 1
+            has = True
+        if v := exif.get("ExposureTime"):
+            shutter_speeds[v] = shutter_speeds.get(v, 0) + 1
+            has = True
+        if has:
+            with_exif += 1
+
+    def sorted_items(d: dict, key_fn) -> list:
+        items = [{"label": k, "count": v} for k, v in d.items()]
+        try:
+            items.sort(key=lambda x: key_fn(x["label"]))
+        except Exception:
+            items.sort(key=lambda x: -x["count"])
+        return items
+
+    def parse_shutter(s: str) -> float:
+        t = s.replace("s", "")
+        if "/" in t:
+            n, d = t.split("/")
+            return float(n) / float(d)
+        return float(t)
+
+    return {
+        "total": total,
+        "matched": matched,
+        "with_exif": with_exif,
+        "focal_lengths": sorted_items(focal_lengths, lambda s: float(s.replace("mm", ""))),
+        "apertures":     sorted_items(apertures,     lambda s: float(s.replace("f/", ""))),
+        "isos":          sorted_items(isos,           lambda s: int(s)),
+        "shutter_speeds":sorted_items(shutter_speeds, parse_shutter),
+    }
+
+
 @app.get("/api/browse")
 def browse(path: str = ""):
     target = Path(path).expanduser() if path else Path.home()
