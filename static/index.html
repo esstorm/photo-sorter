@@ -207,6 +207,14 @@
             <span x-show="!groupsLoading && groups.length > 0" class="text-violet-400 font-bold text-[10px]" x-text="groups.length"></span>
             Groups
           </button>
+          <button @click="setViewMode('issues')"
+                  class="text-xs px-2.5 py-1 rounded-md font-medium transition-colors flex items-center gap-1"
+                  :class="viewMode==='issues' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white'">
+            <span x-show="!qualityIssuesLoading && qualityIssues.length > 0 && filteredIssues().length > 0"
+                  class="text-red-400 font-bold text-[10px]" x-text="filteredIssues().length"></span>
+            <span x-show="qualityIssuesLoading" class="w-2.5 h-2.5 border border-current border-t-transparent rounded-full animate-spin"></span>
+            Suggested
+          </button>
           <button @click="setViewMode('stats')"
                   class="text-xs px-2.5 py-1 rounded-md font-medium transition-colors"
                   :class="viewMode==='stats' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white'">Stats</button>
@@ -557,6 +565,128 @@
       </div>
     </div>
 
+    <!-- Suggested / quality issues view -->
+    <div x-show="viewMode === 'issues'" class="flex-1 overflow-y-auto">
+
+      <!-- Sticky header with sliders -->
+      <div class="sticky top-0 bg-slate-900/95 backdrop-blur border-b border-slate-800 px-6 py-4 space-y-3 z-10">
+        <div class="flex items-center justify-between">
+          <div>
+            <h3 class="text-sm font-semibold text-slate-200">Suggested for deletion</h3>
+            <p class="text-xs text-slate-500 mt-0.5">Photos that may be worth deleting based on quality analysis</p>
+          </div>
+          <button x-show="filteredIssues().length > 0" @click="markAllIssuesAsDelete()"
+                  class="flex-shrink-0 text-xs bg-red-900/60 hover:bg-red-800/60 text-red-300 px-3 py-1.5 rounded-lg border border-red-800/40 transition-colors font-medium">
+            Mark <span x-text="filteredIssues().length"></span> as Delete →
+          </button>
+        </div>
+        <div class="grid grid-cols-2 gap-5">
+          <div>
+            <div class="flex items-center justify-between text-[11px] mb-1.5">
+              <span class="text-slate-500 font-medium">Blur threshold</span>
+              <span class="text-slate-300 font-mono tabular-nums">score &lt; <span x-text="issueBlurThreshold"></span></span>
+            </div>
+            <input type="range" min="0" max="2000" step="50" x-model.number="issueBlurThreshold"
+                   class="w-full h-1 accent-yellow-500 cursor-pointer" />
+            <div class="flex justify-between text-[10px] text-slate-600 mt-1">
+              <span>Off (0)</span><span>Current default (500)</span><span>Aggressive (2000)</span>
+            </div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between text-[11px] mb-1.5">
+              <span class="text-slate-500 font-medium">Overexposure threshold</span>
+              <span class="text-slate-300 font-mono tabular-nums">lum &gt; <span x-text="issueOverexpThreshold"></span></span>
+            </div>
+            <input type="range" min="100" max="256" step="5" x-model.number="issueOverexpThreshold"
+                   class="w-full h-1 accent-orange-500 cursor-pointer" />
+            <div class="flex justify-between text-[10px] text-slate-600 mt-1">
+              <span>Strict (100)</span><span>Default (185)</span><span>Off (256)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Loading -->
+      <div x-show="qualityIssuesLoading" class="flex items-center justify-center py-20">
+        <div class="text-center space-y-3">
+          <div class="w-8 h-8 border-2 border-red-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+          <p class="text-slate-500 text-sm">Scanning analyzed photos…</p>
+        </div>
+      </div>
+
+      <!-- Empty -->
+      <div x-show="!qualityIssuesLoading && filteredIssues().length === 0 && qualityIssues.length > 0"
+           class="flex items-center justify-center py-20">
+        <div class="text-center">
+          <p class="text-slate-400 text-sm font-medium">No photos match these thresholds</p>
+          <p class="text-slate-600 text-xs mt-1">Try loosening the sliders above.</p>
+        </div>
+      </div>
+      <div x-show="!qualityIssuesLoading && qualityIssues.length === 0"
+           class="flex items-center justify-center py-20">
+        <div class="text-center">
+          <p class="text-slate-400 text-sm font-medium">No photos analyzed yet</p>
+          <p class="text-slate-600 text-xs mt-1">Browse through photos in Sort view first — analysis runs automatically.</p>
+        </div>
+      </div>
+
+      <!-- Grid -->
+      <div x-show="!qualityIssuesLoading && filteredIssues().length > 0" class="p-6">
+        <p class="text-xs text-slate-500 mb-4">
+          <span x-text="filteredIssues().length"></span> of
+          <span x-text="qualityIssues.length"></span> analyzed photos match ·
+          <span x-text="photos.length - qualityIssues.length"></span> not yet analyzed
+        </p>
+        <div class="grid gap-2" style="grid-template-columns: repeat(auto-fill, minmax(140px, 1fr))">
+          <template x-for="issue in filteredIssues()" :key="issue.path">
+            <div class="relative cursor-pointer group rounded-xl overflow-hidden bg-slate-800 border transition-all"
+                 :class="classifications[issue.path] === 'delete'
+                   ? 'border-red-600/60 ring-1 ring-red-600/40'
+                   : 'border-slate-700/40 hover:border-slate-600'"
+                 @click="jumpTo(issue.path)">
+              <img :src="`/api/thumbnail?path=${enc(issue.path)}&folder=${enc(currentFolder)}`"
+                   class="w-full h-24 object-cover group-hover:opacity-90 transition-opacity" loading="lazy" />
+
+              <!-- Issue reason pills -->
+              <div class="absolute top-1 left-1 flex flex-col gap-0.5">
+                <span x-show="issue.blur_score >= 0 && issue.blur_score < issueBlurThreshold"
+                      class="text-[9px] bg-yellow-900/90 text-yellow-300 px-1 py-0.5 rounded font-semibold leading-tight">blurry</span>
+                <span x-show="issue.luminance !== null && issue.luminance > issueOverexpThreshold"
+                      class="text-[9px] bg-orange-900/90 text-orange-300 px-1 py-0.5 rounded font-semibold leading-tight">overexp</span>
+              </div>
+
+              <!-- Classification badge -->
+              <div x-show="classifications[issue.path]"
+                   class="absolute top-1 right-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase leading-tight"
+                   :class="badgeClass(classifications[issue.path])"
+                   x-text="classifications[issue.path]"></div>
+
+              <!-- Info -->
+              <div class="px-2 pt-1.5 pb-1">
+                <p class="text-[10px] text-slate-400 truncate" x-text="issue.name"></p>
+                <div class="flex items-center gap-2 mt-0.5">
+                  <span class="text-[10px] text-slate-600 font-mono tabular-nums"
+                        x-text="issue.blur_score >= 0 ? issue.blur_score.toFixed(0) : '—'"></span>
+                  <span x-show="issue.luminance !== null"
+                        class="text-[10px] text-slate-600 font-mono tabular-nums"
+                        x-text="'☀' + (issue.luminance || 0).toFixed(0)"></span>
+                </div>
+              </div>
+
+              <!-- Quick delete button -->
+              <button x-show="classifications[issue.path] !== 'delete'"
+                      @click.stop="(() => { classifications = {...classifications, [issue.path]: 'delete'}; fetch('/api/classify', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:issue.path,folder:currentFolder,action:'delete'})}).catch(()=>{}); })()"
+                      class="absolute bottom-1 right-1 bg-red-900/80 hover:bg-red-700 text-red-200 text-[10px] px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-all font-medium">✕</button>
+              <!-- Undo delete button -->
+              <button x-show="classifications[issue.path] === 'delete'"
+                      @click.stop="(() => { const u = {...classifications}; delete u[issue.path]; classifications = u; })()"
+                      class="absolute bottom-1 right-1 bg-slate-800/90 hover:bg-slate-700 text-slate-300 text-[10px] px-1.5 py-0.5 rounded transition-all font-medium">undo</button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
     <!-- Stats view -->
     <div x-show="viewMode === 'stats'" class="flex-1 overflow-y-auto">
       <div x-show="statsLoading" class="flex items-center justify-center h-full py-20">
@@ -866,6 +996,10 @@
       exportedPath: '',
       showFixPreview: false,
       fixStrength: 3,
+      issueBlurThreshold: 500,
+      issueOverexpThreshold: 185,
+      qualityIssues: [],
+      qualityIssuesLoading: false,
 
       zoom: 1,
       panX: 0,
@@ -929,6 +1063,7 @@
           this.viewMode = 'sort';
           this.stats = null;
           this.statsCache = {};
+          this.qualityIssues = [];
 
           // Sync URL
           const url = new URL(window.location);
@@ -1152,6 +1287,8 @@
           this.loadGroupsBackground();
         } else if (mode === 'stats') {
           await this.loadStats();
+        } else if (mode === 'issues') {
+          this.loadQualityIssues();
         }
       },
 
@@ -1181,6 +1318,39 @@
       async showStats() {
         this.viewMode = 'stats';
         await this.loadStats();
+      },
+
+      async loadQualityIssues() {
+        if (this.qualityIssuesLoading) return;
+        this.qualityIssuesLoading = true;
+        try {
+          const res = await fetch(`/api/quality_issues?folder=${enc(this.currentFolder)}`);
+          if (res.ok) this.qualityIssues = (await res.json()).issues;
+        } finally {
+          this.qualityIssuesLoading = false;
+        }
+      },
+
+      filteredIssues() {
+        return this.qualityIssues.filter(issue => {
+          const isBlurry = issue.blur_score >= 0 && issue.blur_score < this.issueBlurThreshold;
+          const isOverexp = issue.luminance !== null && issue.luminance > this.issueOverexpThreshold;
+          return isBlurry || isOverexp;
+        });
+      },
+
+      async markAllIssuesAsDelete() {
+        const issues = this.filteredIssues();
+        const updated = { ...this.classifications };
+        for (const issue of issues) {
+          updated[issue.path] = 'delete';
+          fetch('/api/classify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: issue.path, folder: this.currentFolder, action: 'delete' }),
+          }).catch(() => {});
+        }
+        this.classifications = updated;
       },
 
       async loadStats() {

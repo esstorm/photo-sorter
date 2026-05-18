@@ -112,6 +112,11 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_file_hash ON photos(file_hash);
     """)
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE photos ADD COLUMN luminance REAL")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
     conn.close()
 
 
@@ -545,6 +550,7 @@ def analyze(path: str, folder: str) -> dict:
     fix_hints: list[str] = []
     skew_angle: float = 0.0
     keystone_frac: float = 0.0
+    luminance: float = -1.0
     try:
         img = open_as_pil(path)
         img = ImageOps.exif_transpose(img)
@@ -552,6 +558,12 @@ def analyze(path: str, folder: str) -> dict:
         skew_angle, _skew_conf = detect_skew(img)
         keystone_frac, _ks_conf = detect_keystone(img)
         fix_hints = get_fix_hints(img, score, skew_angle, keystone_frac)
+        small = img.convert("RGB").resize((256, 256), Image.LANCZOS)
+        arr = np.array(small, dtype=np.float32)
+        r_c = arr[:, :, 0].mean()
+        g_c = arr[:, :, 1].mean()
+        b_c = arr[:, :, 2].mean()
+        luminance = round(float(r_c * 0.299 + g_c * 0.587 + b_c * 0.114), 1)
     except Exception:
         w, h = 0, 0
 
@@ -588,27 +600,30 @@ def analyze(path: str, folder: str) -> dict:
         "skew_angle": skew_angle,
         "keystone_frac": keystone_frac,
         "fix_hints": fix_hints,
+        "luminance": luminance if luminance >= 0 else None,
         "cross_folder_duplicates": cross_dupes,
     }
     analysis_cache[path] = result
 
+    lum_val = luminance if luminance >= 0 else None
     with get_db() as conn:
         conn.execute(
             """
             INSERT INTO photos
                 (path, folder, name, size_mb, width, height, blur_score,
-                 suggest_delete, file_hash, dhash, exif_json, raw_companion)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 suggest_delete, file_hash, dhash, exif_json, raw_companion, luminance)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(path) DO UPDATE SET
                 folder=excluded.folder,
                 size_mb=excluded.size_mb, width=excluded.width,
                 height=excluded.height, blur_score=excluded.blur_score,
                 suggest_delete=excluded.suggest_delete,
                 file_hash=excluded.file_hash, dhash=excluded.dhash,
-                exif_json=excluded.exif_json, raw_companion=excluded.raw_companion
+                exif_json=excluded.exif_json, raw_companion=excluded.raw_companion,
+                luminance=excluded.luminance
             """,
             (path, folder, f.name, result["size_mb"], w, h, round(score, 1),
-             int(result["suggest_delete"]), file_hash, dhash, json.dumps(exif), raw_companion),
+             int(result["suggest_delete"]), file_hash, dhash, json.dumps(exif), raw_companion, lum_val),
         )
     return result
 
@@ -861,6 +876,34 @@ def get_fix_preview(path: str, folder: str, strength: int = 3):
         return StreamingResponse(io.BytesIO(jpeg_bytes), media_type="image/jpeg")
     except Exception as e:
         raise HTTPException(500, f"Could not generate fixed preview: {e}")
+
+
+@app.get("/api/quality_issues")
+def get_quality_issues(folder: str):
+    folder = require_valid_folder(folder)
+    photos = scan_photos(folder)
+    if not photos:
+        return {"issues": [], "total_analyzed": 0}
+    placeholders = ",".join("?" * len(photos))
+    with get_db() as conn:
+        rows = conn.execute(
+            f"SELECT path, name, blur_score, luminance FROM photos "
+            f"WHERE path IN ({placeholders}) AND blur_score >= 0",
+            photos,
+        ).fetchall()
+    return {
+        "issues": [
+            {
+                "path": r["path"],
+                "name": r["name"] or Path(r["path"]).name,
+                "blur_score": round(r["blur_score"], 1),
+                "luminance": round(r["luminance"], 1) if r["luminance"] is not None else None,
+            }
+            for r in rows
+        ],
+        "total_analyzed": len(rows),
+        "total": len(photos),
+    }
 
 
 @app.post("/api/export")
