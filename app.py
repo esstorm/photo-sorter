@@ -9,8 +9,8 @@ from pathlib import Path
 
 import numpy as np
 import rawpy
-from PIL import Image, ImageFilter, ExifTags
-from fastapi import FastAPI, HTTPException
+from PIL import Image, ImageFilter, ImageOps, ExifTags
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -43,6 +43,8 @@ SIMILARITY_THRESHOLD = 10
 # Central database — one file for all projects
 CONFIG_DIR = Path.home() / ".config" / "photo_sorter"
 DB_PATH = CONFIG_DIR / "photos.db"
+THUMB_DIR = Path.home() / ".cache" / "photo_sorter" / "thumbs"
+THUMB_SIZE = 300  # px on longest edge
 
 # In-memory caches keyed by absolute path
 analysis_cache: dict = {}
@@ -50,6 +52,25 @@ raw_preview_cache: dict[str, bytes] = {}  # RAW path -> JPEG bytes
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
+
+def thumb_path(photo_path: str) -> Path:
+    key = hashlib.md5(photo_path.encode()).hexdigest()
+    return THUMB_DIR / f"{key}.jpg"
+
+
+def build_thumbnail(photo_path: str) -> Path:
+    dst = thumb_path(photo_path)
+    if dst.exists():
+        # Invalidate if source is newer
+        if Path(photo_path).stat().st_mtime <= dst.stat().st_mtime:
+            return dst
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    img = open_as_pil(photo_path)
+    img = ImageOps.exif_transpose(img)
+    img.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
+    img.convert("RGB").save(dst, format="JPEG", quality=82, optimize=True)
+    return dst
+
 
 def init_db() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -217,18 +238,39 @@ def compute_blur_score(path: str) -> float:
 
 def get_exif(path: str) -> dict:
     try:
-        # For RAW files, read EXIF from the embedded thumbnail PIL image
         img = open_as_pil(path) if is_raw(path) else Image.open(path)
         raw_exif = img.getexif()
         if not raw_exif:
             return {}
-        wanted = {"Make", "Model", "DateTime", "DateTimeOriginal"}
+        wanted = {"Make", "Model", "DateTime", "DateTimeOriginal",
+                  "LensModel", "FNumber", "ExposureTime", "ISOSpeedRatings",
+                  "FocalLength", "FocalLengthIn35mmFilm"}
         result = {}
-        for tag_id, val in raw_exif.items():
+        # Merge ExifIFD sub-IFD — this is where FNumber, ExposureTime, ISO, FocalLength live
+        all_tags: dict = dict(raw_exif)
+        try:
+            all_tags.update(raw_exif.get_ifd(0x8769))
+        except Exception:
+            pass
+        for tag_id, val in all_tags.items():
             tag = ExifTags.TAGS.get(tag_id, "")
-            if tag in wanted:
-                if isinstance(val, bytes):
-                    val = val.decode("utf-8", errors="replace")
+            if tag not in wanted:
+                continue
+            if isinstance(val, bytes):
+                val = val.decode("utf-8", errors="replace")
+                result[tag] = val
+                continue
+            try:
+                if tag == "FNumber":
+                    result[tag] = f"f/{float(val):.1f}"
+                elif tag == "ExposureTime":
+                    fval = float(val)
+                    result[tag] = f"1/{round(1/fval)}s" if fval > 0 and fval < 1 else f"{fval:.1f}s"
+                elif tag in ("FocalLength", "FocalLengthIn35mmFilm"):
+                    result[tag] = f"{float(val):.0f}mm"
+                else:
+                    result[tag] = str(val)
+            except Exception:
                 result[tag] = str(val)
         return result
     except Exception:
@@ -365,6 +407,17 @@ class ExecuteReq(BaseModel):
     folder: str
 
 
+class RotateReq(BaseModel):
+    folder: str
+    path: str
+    degrees: int
+
+
+class PrefetchReq(BaseModel):
+    folder: str
+    paths: list[str]
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/projects")
@@ -455,6 +508,67 @@ def get_image(path: str, folder: str):
         jpeg_bytes = raw_preview_jpeg(path)
         return StreamingResponse(io.BytesIO(jpeg_bytes), media_type="image/jpeg")
     return FileResponse(path)
+
+
+@app.get("/api/thumbnail")
+def get_thumbnail(path: str, folder: str):
+    folder = require_valid_folder(folder)
+    validate_path(path, folder)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Not found")
+    try:
+        dst = build_thumbnail(path)
+    except Exception:
+        raise HTTPException(500, "Could not generate thumbnail")
+    return FileResponse(dst, media_type="image/jpeg")
+
+
+@app.post("/api/rotate")
+def rotate_photo(req: RotateReq):
+    if req.degrees not in (90, 180, 270):
+        raise HTTPException(400, "degrees must be 90, 180, or 270")
+    folder = require_valid_folder(req.folder)
+    validate_path(req.path, folder)
+    if not os.path.isfile(req.path):
+        raise HTTPException(404, "Not found")
+    if is_raw(req.path):
+        raise HTTPException(400, "RAW files cannot be rotated in place")
+    try:
+        img = Image.open(req.path)
+        img = ImageOps.exif_transpose(img)        # bake in any existing EXIF orientation first
+        rotated = img.rotate(-req.degrees, expand=True)
+        ext = Path(req.path).suffix.lower()
+        if ext in {".jpg", ".jpeg"}:
+            rotated.save(req.path, format="JPEG", quality=95, optimize=True)
+        else:
+            rotated.save(req.path)
+    except Exception as e:
+        raise HTTPException(500, f"Could not rotate: {e}")
+    analysis_cache.pop(req.path, None)
+    raw_preview_cache.pop(req.path, None)
+    thumb_path(req.path).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+def _warm_image_cache(path: str) -> None:
+    try:
+        if is_raw(path):
+            raw_preview_jpeg(path)
+    except Exception:
+        pass
+
+
+@app.post("/api/prefetch")
+def prefetch_images(req: PrefetchReq, background_tasks: BackgroundTasks):
+    folder = require_valid_folder(req.folder)
+    for path in req.paths[:5]:
+        try:
+            validate_path(path, folder)
+            if os.path.isfile(path):
+                background_tasks.add_task(_warm_image_cache, path)
+        except Exception:
+            pass
+    return {"ok": True}
 
 
 @app.post("/api/classify")
@@ -567,6 +681,46 @@ def execute(req: ExecuteReq):
     return {"moved": moved, "raw_moved": raw_moved, "errors": errors, "trash": str(trash)}
 
 
+@app.post("/api/execute_unsure")
+def execute_unsure(req: ExecuteReq):
+    folder = require_valid_folder(req.folder)
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT path, raw_companion FROM photos WHERE folder=? AND classification='unsure'",
+            (folder,),
+        ).fetchall()
+
+    unsure_dir = Path(folder) / "_unsure"
+    unsure_dir.mkdir(exist_ok=True)
+    moved, raw_moved, errors = [], [], []
+
+    for row in rows:
+        src = Path(row["path"])
+        if not src.exists():
+            continue
+
+        name = _move_to_trash(src, unsure_dir)
+        if name:
+            moved.append(name)
+            analysis_cache.pop(str(src), None)
+        else:
+            errors.append({"name": src.name, "error": "could not move"})
+            continue
+
+        raw_path = row["raw_companion"] or find_raw_companion(str(src))
+        if raw_path:
+            raw_src = Path(raw_path)
+            if raw_src.exists():
+                raw_name = _move_to_trash(raw_src, unsure_dir)
+                if raw_name:
+                    raw_moved.append(raw_name)
+                else:
+                    errors.append({"name": raw_src.name, "error": "could not move RAW"})
+
+    registry_upsert(folder, len(scan_photos(folder)))
+    return {"moved": moved, "raw_moved": raw_moved, "errors": errors, "unsure_dir": str(unsure_dir)}
+
+
 @app.get("/api/browse")
 def browse(path: str = ""):
     target = Path(path).expanduser() if path else Path.home()
@@ -588,6 +742,7 @@ def browse(path: str = ""):
 static_dir = Path(__file__).parent / "static"
 app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
+init_db()
+
 if __name__ == "__main__":
-    init_db()
-    uvicorn.run(app, host="127.0.0.1", port=8765, reload=False)
+    uvicorn.run("app:app", host="127.0.0.1", port=8765, reload=True)

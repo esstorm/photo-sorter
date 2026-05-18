@@ -145,7 +145,9 @@
         <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">D</kbd> Delete</div>
         <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">U</kbd> Unsure</div>
         <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">G</kbd> Groups</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">L</kbd> Gallery</div>
         <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">Z</kbd> Undo</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">R</kbd> Rotate</div>
       </div>
     </div>
   </div>
@@ -194,6 +196,7 @@
           <span x-show="!groupsLoading && groups.length > 0" class="text-violet-400 font-semibold" x-text="groups.length"></span>
           Groups
         </button>
+        <button @click="screen='gallery'; galleryFilter=null" class="text-sm bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors text-slate-300">Gallery</button>
         <button @click="openReview()" class="text-sm bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors text-slate-300">Review →</button>
       </div>
     </div>
@@ -242,14 +245,14 @@
         </div>
 
         <template x-if="currentPhoto">
-          <img :src="`/api/image?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}`"
-               :key="currentPhoto.path"
+          <img :src="`/api/image?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}&_=${imageRefreshKey}`"
+               :key="currentPhoto.path + imageRefreshKey"
                class="max-h-full max-w-full object-contain img-fade select-none"
                :class="zoom > 1 ? (_isPanning ? 'cursor-grabbing' : 'cursor-grab') : ''"
                :style="`max-height:calc(100vh - 148px);
-                        transform: translate(${panX}px, ${panY}px) scale(${zoom});
+                        transform: translate(${panX}px, ${panY}px) scale(${zoom}) rotate(${photoRotation}deg);
                         transform-origin: center;
-                        transition: ${_isPanning ? 'none' : 'transform 0.12s ease'}`"
+                        transition: ${_isPanning ? 'none' : 'transform 0.15s ease'}`"
                @pointerdown="startPan($event)"
                @pointermove="doPan($event)"
                @pointerup="endPan()"
@@ -307,6 +310,31 @@
               </div>
             </template>
 
+            <template x-if="currentPhoto.exif && (currentPhoto.exif.FNumber || currentPhoto.exif.ExposureTime || currentPhoto.exif.ISOSpeedRatings || currentPhoto.exif.FocalLength)">
+              <div>
+                <p class="lbl">Exposure</p>
+                <div class="grid grid-cols-2 gap-2">
+                  <div x-show="currentPhoto.exif.FocalLength" class="bg-slate-800/60 rounded-lg px-3 py-2">
+                    <p class="text-xs text-slate-500 mb-0.5">Focal length</p>
+                    <p class="text-sm text-slate-200 font-mono tabular-nums" x-text="currentPhoto.exif.FocalLength"></p>
+                  </div>
+                  <div x-show="currentPhoto.exif.FNumber" class="bg-slate-800/60 rounded-lg px-3 py-2">
+                    <p class="text-xs text-slate-500 mb-0.5">Aperture</p>
+                    <p class="text-sm text-slate-200 font-mono tabular-nums" x-text="currentPhoto.exif.FNumber"></p>
+                  </div>
+                  <div x-show="currentPhoto.exif.ExposureTime" class="bg-slate-800/60 rounded-lg px-3 py-2">
+                    <p class="text-xs text-slate-500 mb-0.5">Shutter</p>
+                    <p class="text-sm text-slate-200 font-mono tabular-nums" x-text="currentPhoto.exif.ExposureTime"></p>
+                  </div>
+                  <div x-show="currentPhoto.exif.ISOSpeedRatings" class="bg-slate-800/60 rounded-lg px-3 py-2">
+                    <p class="text-xs text-slate-500 mb-0.5">ISO</p>
+                    <p class="text-sm text-slate-200 font-mono tabular-nums" x-text="currentPhoto.exif.ISOSpeedRatings"></p>
+                  </div>
+                </div>
+                <p x-show="currentPhoto.exif.LensModel" class="text-xs text-slate-500 font-mono mt-2 leading-snug break-all" x-text="currentPhoto.exif.LensModel"></p>
+              </div>
+            </template>
+
             <!-- RAW companion -->
             <template x-if="currentPhoto.raw_companion">
               <div class="bg-orange-950/40 border border-orange-800/40 rounded-xl p-3">
@@ -344,7 +372,7 @@
                 <div class="grid grid-cols-3 gap-1.5">
                   <template x-for="sim in getSimilar()" :key="sim">
                     <div class="relative cursor-pointer group" @click="jumpTo(sim)">
-                      <img :src="`/api/image?path=${enc(sim)}&folder=${enc(currentFolder)}`"
+                      <img :src="`/api/thumbnail?path=${enc(sim)}&folder=${enc(currentFolder)}`"
                            class="w-full h-16 object-cover rounded-lg bg-slate-800 group-hover:ring-2 ring-violet-500 transition-all" />
                       <div x-show="classifications[sim]" class="absolute inset-0 rounded-lg opacity-40"
                            :class="overlayClass(classifications[sim])"></div>
@@ -393,6 +421,12 @@
       <button @click="undo()" class="text-slate-500 hover:text-slate-300 text-xs transition-colors px-2 py-1.5">
         <kbd class="bg-slate-800 px-1.5 py-0.5 rounded font-mono text-xs">Z</kbd> Undo
       </button>
+      <div class="w-px h-5 bg-slate-700"></div>
+      <button @click="rotatePhoto()" :disabled="rotating"
+              class="text-slate-500 hover:text-slate-300 text-xs transition-colors px-2 py-1.5 disabled:opacity-40"
+              :class="photoRotation ? 'text-blue-400' : ''">
+        <kbd class="bg-slate-800 px-1.5 py-0.5 rounded font-mono text-xs">R</kbd> Rotate
+      </button>
     </div>
   </div>
 
@@ -440,7 +474,7 @@
           <div class="flex gap-2 overflow-x-auto pb-1">
             <template x-for="member in group" :key="member.path">
               <div class="relative flex-shrink-0 cursor-pointer group" @click="jumpTo(member.path)" style="width:140px">
-                <img :src="`/api/image?path=${enc(member.path)}&folder=${enc(currentFolder)}`"
+                <img :src="`/api/thumbnail?path=${enc(member.path)}&folder=${enc(currentFolder)}`"
                      class="w-full h-24 object-cover rounded-xl bg-slate-800 group-hover:ring-2 ring-violet-500 transition-all" />
                 <div x-show="classifications[member.path]" class="absolute inset-0 rounded-xl opacity-40"
                      :class="overlayClass(classifications[member.path])"></div>
@@ -453,6 +487,57 @@
           </div>
         </div>
       </template>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════ GALLERY -->
+  <div x-show="screen === 'gallery'" class="h-screen flex flex-col overflow-hidden">
+    <div class="flex items-center gap-3 px-4 py-3 bg-slate-900 border-b border-slate-800 flex-shrink-0">
+      <button @click="openMenu()" class="text-slate-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-slate-800">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+        </svg>
+      </button>
+      <button @click="screen='sorting'" class="text-slate-400 hover:text-white text-sm transition-colors">← Back</button>
+      <h2 class="text-sm font-semibold text-white">Gallery</h2>
+      <span class="text-xs text-slate-500">
+        <span x-text="galleryList().length"></span> photo<span x-show="galleryList().length !== 1">s</span>
+      </span>
+    </div>
+
+    <div class="flex items-center gap-1.5 px-4 py-2 bg-slate-900 border-b border-slate-800/60 flex-shrink-0 overflow-x-auto">
+      <template x-for="[f, label, cls] in filterOptions()" :key="String(f)">
+        <button @click="galleryFilter = f"
+                class="flex-shrink-0 text-xs px-3 py-1.5 rounded-lg font-medium transition-colors"
+                :class="galleryFilter === f
+                  ? `${cls} ring-1 ring-current`
+                  : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'">
+          <span x-text="label"></span>
+          <span class="ml-1 opacity-60" x-text="'(' + filterCount(f) + ')'"></span>
+        </button>
+      </template>
+    </div>
+
+    <div class="flex-1 overflow-y-auto p-3">
+      <div x-show="galleryList().length === 0" class="flex items-center justify-center h-32 text-slate-600 text-sm">
+        No photos in this category
+      </div>
+      <div class="grid gap-1.5" style="grid-template-columns: repeat(auto-fill, minmax(130px, 1fr))">
+        <template x-for="path in galleryList()" :key="path">
+          <div class="relative cursor-pointer group aspect-square rounded-lg overflow-hidden bg-slate-800"
+               @click="jumpTo(path)">
+            <img :src="`/api/thumbnail?path=${enc(path)}&folder=${enc(currentFolder)}`"
+                 class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+                 loading="lazy" />
+            <div x-show="classifications[path]" class="absolute inset-0 opacity-25 pointer-events-none"
+                 :class="overlayClass(classifications[path])"></div>
+            <div x-show="classifications[path]"
+                 class="absolute top-1 left-1 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase leading-none"
+                 :class="badgeClass(classifications[path])" x-text="classifications[path]"></div>
+            <div class="absolute inset-0 ring-2 ring-inset ring-transparent group-hover:ring-blue-400 rounded-lg transition-all pointer-events-none"></div>
+          </div>
+        </template>
+      </div>
     </div>
   </div>
 
@@ -500,7 +585,7 @@
           <div class="grid grid-cols-5 gap-2 mb-6 max-h-72 overflow-y-auto pr-1">
             <template x-for="path in getDeletePhotos()" :key="path">
               <div class="relative group">
-                <img :src="`/api/image?path=${enc(path)}&folder=${enc(currentFolder)}`"
+                <img :src="`/api/thumbnail?path=${enc(path)}&folder=${enc(currentFolder)}`"
                      class="w-full h-24 object-cover rounded-lg border border-red-800/40 bg-slate-800" />
                 <div class="absolute inset-0 bg-red-900/20 rounded-lg"></div>
                 <button @click="unclassify(path)"
@@ -527,7 +612,42 @@
         </div>
       </template>
 
-      <div x-show="countAction('delete') === 0" class="text-slate-600 text-sm">No photos marked for deletion.</div>
+      <div x-show="countAction('delete') === 0 && countAction('unsure') === 0" class="text-slate-600 text-sm">No photos marked for deletion or unsure.</div>
+
+      <template x-if="countAction('unsure') > 0">
+        <div class="mt-10">
+          <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4">
+            Moving to _unsure/ — <span x-text="countAction('unsure')"></span> photos
+          </h3>
+          <div class="grid grid-cols-5 gap-2 mb-6 max-h-72 overflow-y-auto pr-1">
+            <template x-for="path in getUnsurePhotos()" :key="path">
+              <div class="relative group">
+                <img :src="`/api/thumbnail?path=${enc(path)}&folder=${enc(currentFolder)}`"
+                     class="w-full h-24 object-cover rounded-lg border border-yellow-800/40 bg-slate-800" />
+                <div class="absolute inset-0 bg-yellow-900/20 rounded-lg"></div>
+                <button @click="unclassify(path)"
+                        class="absolute top-1 right-1 bg-slate-900/90 hover:bg-yellow-800 text-slate-300 hover:text-white rounded-full w-5 h-5 text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all leading-none">×</button>
+                <p class="text-xs text-slate-500 mt-1 truncate" x-text="path.split('/').pop()"></p>
+              </div>
+            </template>
+          </div>
+          <div class="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 mb-5 text-sm text-slate-400 leading-relaxed">
+            <span class="text-white font-semibold" x-text="countAction('unsure')"></span> photos
+            <template x-if="rawUnsureCount() > 0">
+              <span> + <span class="text-orange-300 font-semibold" x-text="rawUnsureCount()"></span>
+              <span class="text-orange-300/70"> RAW companion<span x-show="rawUnsureCount() !== 1">s</span></span></span>
+            </template>
+            will be moved to
+            <code class="bg-slate-900 text-slate-300 px-1.5 py-0.5 rounded font-mono text-xs">_unsure/</code>.
+            <strong class="text-white">Not permanently deleted.</strong>
+          </div>
+          <button @click="executeUnsure()" :disabled="executingUnsure"
+                  class="bg-yellow-600 hover:bg-yellow-500 disabled:opacity-50 text-white font-semibold px-6 py-3 rounded-xl transition-colors">
+            <span x-show="!executingUnsure">Move <span x-text="countAction('unsure')"></span> photos to _unsure/ →</span>
+            <span x-show="executingUnsure">Moving…</span>
+          </button>
+        </div>
+      </template>
     </div>
   </div>
 
@@ -538,19 +658,34 @@
         <span class="text-green-400 text-2xl">✓</span>
       </div>
       <h2 class="text-xl font-bold text-white mb-1">Done!</h2>
-      <template x-if="deleteResults">
-        <div class="space-y-2 text-sm text-slate-400 mt-3">
-          <p>
-            <span class="text-white font-semibold" x-text="deleteResults.moved.length"></span>
-            photo<span x-show="deleteResults.moved.length !== 1">s</span> moved to trash
-            <template x-if="deleteResults.raw_moved && deleteResults.raw_moved.length > 0">
-              <span class="text-orange-300/80"> + <span x-text="deleteResults.raw_moved.length"></span> RAW file<span x-show="deleteResults.raw_moved.length !== 1">s</span></span>
-            </template>
-          </p>
-          <p class="font-mono text-xs text-slate-600 break-all" x-text="deleteResults.trash"></p>
-        </div>
-      </template>
+      <div class="space-y-3 text-sm text-slate-400 mt-3">
+        <template x-if="deleteResults">
+          <div>
+            <p>
+              <span class="text-white font-semibold" x-text="deleteResults.moved.length"></span>
+              photo<span x-show="deleteResults.moved.length !== 1">s</span> moved to trash
+              <template x-if="deleteResults.raw_moved && deleteResults.raw_moved.length > 0">
+                <span class="text-orange-300/80"> + <span x-text="deleteResults.raw_moved.length"></span> RAW file<span x-show="deleteResults.raw_moved.length !== 1">s</span></span>
+              </template>
+            </p>
+            <p class="font-mono text-xs text-slate-600 break-all mt-1" x-text="deleteResults.trash"></p>
+          </div>
+        </template>
+        <template x-if="unsureResults">
+          <div>
+            <p>
+              <span class="text-white font-semibold" x-text="unsureResults.moved.length"></span>
+              photo<span x-show="unsureResults.moved.length !== 1">s</span> moved to _unsure/
+              <template x-if="unsureResults.raw_moved && unsureResults.raw_moved.length > 0">
+                <span class="text-orange-300/80"> + <span x-text="unsureResults.raw_moved.length"></span> RAW file<span x-show="unsureResults.raw_moved.length !== 1">s</span></span>
+              </template>
+            </p>
+            <p class="font-mono text-xs text-slate-600 break-all mt-1" x-text="unsureResults.unsure_dir"></p>
+          </div>
+        </template>
+      </div>
       <div class="flex gap-3 justify-center mt-6">
+        <button @click="screen='review'" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold px-4 py-2.5 rounded-xl text-sm transition-colors">← Review</button>
         <button @click="screen='sorting'" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold px-4 py-2.5 rounded-xl text-sm transition-colors">Keep sorting</button>
         <button @click="screen='setup'; currentFolder=''; folderPath=''"
                 class="bg-blue-600 hover:bg-blue-500 text-white font-semibold px-4 py-2.5 rounded-xl text-sm transition-colors">New folder</button>
@@ -627,6 +762,9 @@
       flashTimer: null,
       executing: false,
       deleteResults: null,
+      unsureResults: null,
+      executingUnsure: false,
+      galleryFilter: null,
 
       menuOpen: false,
       recentProjects: [],
@@ -640,8 +778,12 @@
       zoom: 1,
       panX: 0,
       panY: 0,
+      photoRotation: 0,
+      rotating: false,
+      imageRefreshKey: 0,
       slideOffset: 0,
       slideAnimate: false,
+      _prefetchedPaths: {},
       _swipeAccum: 0,
       _swipeTimer: null,
       _swipeCommitting: false,
@@ -689,6 +831,10 @@
           this.groupMap = {};
           this.currentPath = '';
           this.currentPhoto = null;
+          this.deleteResults = null;
+          this.unsureResults = null;
+          this.galleryFilter = null;
+          this._prefetchedPaths = {};
 
           // Sync URL
           const url = new URL(window.location);
@@ -720,6 +866,7 @@
         if (!path) return;
         this.currentPath = path;
         this.zoom = 1; this.panX = 0; this.panY = 0;
+        this.photoRotation = 0; this.imageRefreshKey = 0;
         this.slideOffset = 0; this.slideAnimate = false;
         await this.loadPhotoData(path);
       },
@@ -733,10 +880,23 @@
         } finally {
           this.loadingPhoto = false;
         }
-        // Prefetch next
+        this.prefetchAhead(path);
+      },
+
+      prefetchAhead(currentPath) {
         const list = this.activeList();
-        const next = list[list.indexOf(path) + 1];
-        if (next) fetch(`/api/analyze?path=${enc(next)}&folder=${enc(this.currentFolder)}`).catch(() => {});
+        const idx = list.indexOf(currentPath);
+        const ahead = list.slice(idx + 1, idx + 6).filter(p => !this._prefetchedPaths[p]);
+        if (!ahead.length) return;
+        for (const p of ahead) {
+          this._prefetchedPaths[p] = true;
+          fetch(`/api/analyze?path=${enc(p)}&folder=${enc(this.currentFolder)}`).catch(() => {});
+        }
+        fetch('/api/prefetch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths: ahead, folder: this.currentFolder }),
+        }).catch(() => {});
       },
 
       async navigate(dir) {
@@ -840,6 +1000,40 @@
 
       rawDeleteCount() {
         return this.getDeletePhotos().filter(p => this.companions[p]).length;
+      },
+
+      getUnsurePhotos() {
+        return Object.entries(this.classifications).filter(([, a]) => a === 'unsure').map(([p]) => p);
+      },
+
+      rawUnsureCount() {
+        return this.getUnsurePhotos().filter(p => this.companions[p]).length;
+      },
+
+      galleryList() {
+        if (!this.galleryFilter) return this.photos;
+        if (this.galleryFilter === 'unclassified') return this.photos.filter(p => !this.classifications[p]);
+        return this.photos.filter(p => this.classifications[p] === this.galleryFilter);
+      },
+
+      async executeUnsure() {
+        this.executingUnsure = true;
+        try {
+          const res = await fetch('/api/execute_unsure', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder: this.currentFolder }),
+          });
+          this.unsureResults = await res.json();
+          const moved = new Set(this.unsureResults.moved.map(n => `${this.currentFolder}/${n}`));
+          this.photos = this.photos.filter(p => !moved.has(p));
+          const updated = { ...this.classifications };
+          for (const p of moved) delete updated[p];
+          this.classifications = updated;
+          this.screen = 'done';
+        } finally {
+          this.executingUnsure = false;
+        }
       },
 
       // ── Groups ────────────────────────────────────────────────────
@@ -999,6 +1193,27 @@
 
       resetZoom() { this.zoom = 1; this.panX = 0; this.panY = 0; },
 
+      async rotatePhoto() {
+        if (!this.currentPath || this.rotating) return;
+        this.photoRotation = (this.photoRotation + 90) % 360;  // optimistic CSS rotation
+        this.rotating = true;
+        try {
+          const res = await fetch('/api/rotate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: this.currentPath, folder: this.currentFolder, degrees: 90 }),
+          });
+          if (res.ok) {
+            // File saved — reload image from disk, clear CSS rotation
+            this.imageRefreshKey++;
+            this.photoRotation = 0;
+          }
+          // On error (e.g. RAW file): CSS rotation stays as view-only aid
+        } finally {
+          this.rotating = false;
+        }
+      },
+
       // ── Keyboard ──────────────────────────────────────────────────
       handleKey(e) {
         if (['INPUT','TEXTAREA'].includes(e.target.tagName)) return;
@@ -1009,11 +1224,15 @@
           else if (k==='f')         { e.preventDefault(); this.classify('favorite'); }
           else if (k==='u')         { e.preventDefault(); this.classify('unsure'); }
           else if (k==='z')         { e.preventDefault(); this.undo(); }
+          else if (k==='r')         { e.preventDefault(); this.rotatePhoto(); }
           else if (k==='g')         { e.preventDefault(); this.showGroups(); }
+          else if (k==='l')         { e.preventDefault(); this.screen='gallery'; this.galleryFilter=null; }
           else if (e.key==='ArrowLeft')  { e.preventDefault(); this.navigate(-1); }
           else if (e.key==='ArrowRight') { e.preventDefault(); this.navigate(1); }
         } else if (this.screen==='groups') {
           if (k==='g'||e.key==='Escape') { e.preventDefault(); this.screen='sorting'; }
+        } else if (this.screen==='gallery') {
+          if (k==='l'||e.key==='Escape') { e.preventDefault(); this.screen='sorting'; }
         }
       },
 
