@@ -149,6 +149,7 @@
         <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">S</kbd> Stats</div>
         <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">Z</kbd> Undo</div>
         <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">R</kbd> Rotate</div>
+        <div class="flex items-center gap-2"><kbd class="bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded font-mono">E</kbd> Quick fix</div>
       </div>
     </div>
   </div>
@@ -245,6 +246,12 @@
                 x-text="{keep:'♥ KEEP',delete:'✕ DELETE',favorite:'★ FAVORITE',unsure:'? UNSURE'}[flashAction]"></span>
         </div>
 
+        <!-- Fix preview badge -->
+        <div x-show="showFixPreview"
+             class="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 px-3 py-1 rounded-full text-xs font-medium bg-violet-600/80 backdrop-blur text-white pointer-events-none whitespace-nowrap">
+          ✨ Quick fix preview
+        </div>
+
         <!-- Classification badge -->
         <div x-show="currentPhoto && classifications[currentPhoto.path]"
              class="absolute top-3 left-3 z-10 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider"
@@ -258,8 +265,10 @@
         </div>
 
         <template x-if="currentPhoto">
-          <img :src="`/api/image?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}&_=${imageRefreshKey}`"
-               :key="currentPhoto.path + imageRefreshKey"
+          <img :src="showFixPreview
+                 ? `/api/fix_preview?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}`
+                 : `/api/image?path=${enc(currentPhoto.path)}&folder=${enc(currentFolder)}&_=${imageRefreshKey}`"
+               :key="currentPhoto.path + showFixPreview + imageRefreshKey"
                class="max-h-full max-w-full object-contain img-fade select-none"
                :class="zoom > 1 ? (_isPanning ? 'cursor-grabbing' : 'cursor-grab') : ''"
                :style="`max-height:calc(100vh - 148px);
@@ -336,6 +345,26 @@
                 <p class="text-red-300 text-xs font-semibold">Suggested: Delete</p>
                 <p class="text-red-400/60 text-xs mt-0.5 leading-snug">Low sharpness — likely blurry.</p>
               </div>
+            </div>
+
+            <!-- Quick Fix -->
+            <div class="bg-slate-800/40 rounded-xl p-3 space-y-2">
+              <div class="flex items-center justify-between">
+                <p class="text-xs text-slate-500 uppercase tracking-wider font-semibold">Quick Fix</p>
+                <button @click="toggleFixPreview()"
+                        :class="showFixPreview ? 'bg-violet-600 hover:bg-violet-500 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'"
+                        class="flex-shrink-0 flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg transition-colors font-medium">
+                  <span x-text="showFixPreview ? '👁' : '✨'"></span>
+                  <span x-text="showFixPreview ? 'Original' : 'Preview'"></span>
+                </button>
+              </div>
+              <div x-show="currentPhoto.fix_hints && currentPhoto.fix_hints.length > 0" class="flex flex-wrap gap-1">
+                <template x-for="hint in (currentPhoto.fix_hints || [])" :key="hint">
+                  <span class="text-[10px] bg-violet-900/60 text-violet-300 px-2 py-0.5 rounded-full font-medium" x-text="hint"></span>
+                </template>
+              </div>
+              <p x-show="!currentPhoto.fix_hints || currentPhoto.fix_hints.length === 0"
+                 class="text-xs text-slate-600">No specific issues detected</p>
             </div>
 
             <div class="grid grid-cols-2 gap-4">
@@ -826,6 +855,7 @@
 
       exporting: false,
       exportedPath: '',
+      showFixPreview: false,
 
       zoom: 1,
       panX: 0,
@@ -923,6 +953,7 @@
         this.photoRotation = 0; this.imageRefreshKey = 0;
         this.slideOffset = 0; this.slideAnimate = false;
         this.exporting = false; this.exportedPath = '';
+        this.showFixPreview = false;
         await this.loadPhotoData(path);
       },
 
@@ -1334,6 +1365,10 @@
         }
       },
 
+      toggleFixPreview() {
+        this.showFixPreview = !this.showFixPreview;
+      },
+
       revealInFinder(path) {
         fetch(`/api/reveal?path=${enc(path)}&folder=${enc(this.currentFolder)}`).catch(() => {});
       },
@@ -1349,6 +1384,7 @@
           else if (k==='u')         { e.preventDefault(); this.classify('unsure'); }
           else if (k==='z')         { e.preventDefault(); this.undo(); }
           else if (k==='r')         { e.preventDefault(); this.rotatePhoto(); }
+          else if (k==='e')         { e.preventDefault(); this.toggleFixPreview(); }
           else if (k==='g')         { e.preventDefault(); this.setViewMode('groups'); }
           else if (k==='l')         { e.preventDefault(); this.viewMode='gallery'; }
           else if (k==='s')         { e.preventDefault(); this.setViewMode('stats'); }

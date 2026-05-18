@@ -50,6 +50,7 @@ THUMB_SIZE = 300  # px on longest edge
 # In-memory caches keyed by absolute path
 analysis_cache: dict = {}
 raw_preview_cache: dict[str, bytes] = {}  # RAW path -> JPEG bytes
+fix_preview_cache: dict[str, bytes] = {}  # path -> corrected JPEG bytes
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -189,6 +190,34 @@ def raw_preview_jpeg(path: str) -> bytes:
     return raw_preview_cache[path]
 
 
+def get_fix_hints(img: Image.Image, blur_score: float) -> list[str]:
+    hints = []
+    try:
+        small = img.convert("RGB").resize((256, 256), Image.LANCZOS)
+        arr = np.array(small, dtype=np.float32)
+        r = arr[:, :, 0].mean()
+        g = arr[:, :, 1].mean()
+        b = arr[:, :, 2].mean()
+        lum = r * 0.299 + g * 0.587 + b * 0.114
+        if lum < 80 or lum > 185:
+            hints.append("exposure")
+        overall = (r + g + b) / 3
+        if max(abs(r - overall), abs(g - overall), abs(b - overall)) > 12:
+            hints.append("color cast")
+    except Exception:
+        pass
+    if 0 <= blur_score < 500:
+        hints.append("sharpen")
+    return hints
+
+
+def apply_fixes(img: Image.Image, blur_score: float) -> Image.Image:
+    img = ImageOps.autocontrast(img.convert("RGB"), cutoff=1)
+    if 0 <= blur_score < 500:
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=130, threshold=3))
+    return img
+
+
 def find_raw_companion(path: str) -> str:
     p = Path(path)
     for ext in RAW_EXTENSIONS:
@@ -317,9 +346,12 @@ def analyze(path: str, folder: str) -> dict:
     raw_companion = find_raw_companion(path)
     jpeg_companion = find_jpeg_companion(path) if is_raw(path) else ""
 
+    fix_hints: list[str] = []
     try:
         img = open_as_pil(path)
+        img = ImageOps.exif_transpose(img)
         w, h = img.size
+        fix_hints = get_fix_hints(img, score)
     except Exception:
         w, h = 0, 0
 
@@ -353,6 +385,7 @@ def analyze(path: str, folder: str) -> dict:
         "raw_name": Path(raw_companion).name if raw_companion else "",
         "jpeg_companion": jpeg_companion,
         "jpeg_name": Path(jpeg_companion).name if jpeg_companion else "",
+        "fix_hints": fix_hints,
         "cross_folder_duplicates": cross_dupes,
     }
     analysis_cache[path] = result
@@ -582,8 +615,38 @@ def rotate_photo(req: RotateReq):
         raise HTTPException(500, f"Could not rotate: {e}")
     analysis_cache.pop(req.path, None)
     raw_preview_cache.pop(req.path, None)
+    fix_preview_cache.pop(req.path, None)
     thumb_path(req.path).unlink(missing_ok=True)
     return {"ok": True}
+
+
+@app.get("/api/fix_preview")
+def get_fix_preview(path: str, folder: str):
+    folder = require_valid_folder(folder)
+    validate_path(path, folder)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Not found")
+    if path in fix_preview_cache:
+        return StreamingResponse(io.BytesIO(fix_preview_cache[path]), media_type="image/jpeg")
+    blur_score = -1.0
+    if path in analysis_cache:
+        blur_score = analysis_cache[path].get("blur_score", -1.0)
+    else:
+        with get_db() as conn:
+            row = conn.execute("SELECT blur_score FROM photos WHERE path=?", (path,)).fetchone()
+            if row and row["blur_score"] is not None:
+                blur_score = float(row["blur_score"])
+    try:
+        img = open_as_pil(path)
+        img = ImageOps.exif_transpose(img)
+        img = apply_fixes(img, blur_score)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88)
+        jpeg_bytes = buf.getvalue()
+        fix_preview_cache[path] = jpeg_bytes
+        return StreamingResponse(io.BytesIO(jpeg_bytes), media_type="image/jpeg")
+    except Exception as e:
+        raise HTTPException(500, f"Could not generate fixed preview: {e}")
 
 
 @app.post("/api/export")
