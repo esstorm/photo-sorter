@@ -182,6 +182,7 @@ def raw_preview_jpeg(path: str) -> bytes:
     """Return cached JPEG bytes for a RAW file (for browser display)."""
     if path not in raw_preview_cache:
         img = open_as_pil(path)
+        img = ImageOps.exif_transpose(img)
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="JPEG", quality=88)
         raw_preview_cache[path] = buf.getvalue()
