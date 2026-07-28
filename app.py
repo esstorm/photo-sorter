@@ -6,6 +6,9 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import threading
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +61,9 @@ THUMB_SIZE = 300  # px on longest edge
 analysis_cache: dict = {}
 raw_preview_cache: dict[str, bytes] = {}  # RAW path -> JPEG bytes
 fix_preview_cache: dict[tuple[str, int], bytes] = {}  # (path, strength) -> corrected JPEG bytes
+
+# Running export jobs: job_id -> state dict
+export_jobs: dict[str, dict] = {}
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -388,7 +394,8 @@ def get_fix_hints(img: Image.Image, blur_score: float, skew_angle: float = 0.0,
 
 def apply_fixes(img: Image.Image, blur_score: float,
                 strength: int = 3, skew_angle: float = 0.0,
-                keystone_frac: float = 0.0) -> Image.Image:
+                keystone_frac: float = 0.0,
+                for_export: bool = False) -> Image.Image:
     # strength 1-5 maps to progressively more aggressive corrections
     cutoff   = {1: 0, 2: 1, 3: 2, 4: 5, 5: 10}[strength]
     s_pct    = {1: 60, 2: 90, 3: 130, 4: 170, 5: 220}[strength]
@@ -407,11 +414,14 @@ def apply_fixes(img: Image.Image, blur_score: float,
         y1 = (rh - ch) // 2
         x2 = x1 + cw
         y2 = y1 + ch
-        # Darken corners to show the crop boundary
-        arr = np.array(rotated, dtype=np.float32)
-        out = arr * 0.30                      # dark corners
-        out[y1:y2, x1:x2] = arr[y1:y2, x1:x2]  # restore kept area at full brightness
-        img = Image.fromarray(out.clip(0, 255).astype(np.uint8))
+        if for_export:
+            img = rotated.crop((x1, y1, x2, y2))
+        else:
+            # Darken corners to show the crop boundary (preview only)
+            arr = np.array(rotated, dtype=np.float32)
+            out = arr * 0.30                      # dark corners
+            out[y1:y2, x1:x2] = arr[y1:y2, x1:x2]  # restore kept area at full brightness
+            img = Image.fromarray(out.clip(0, 255).astype(np.uint8))
 
     if abs(keystone_frac) >= 0.01:
         img = _apply_keystone(img, keystone_frac)
@@ -704,6 +714,15 @@ class ExportReq(BaseModel):
     path: str
 
 
+class BulkExportReq(BaseModel):
+    folder: str
+    strength: int = 3
+    apply_fixes: bool = True
+    quality: int = 92
+    include_unsure: bool = False
+    include_unreviewed: bool = False
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/projects")
@@ -924,6 +943,160 @@ def export_jpeg(req: ExportReq):
         raise HTTPException(500, f"Could not convert: {e}")
     analysis_cache.pop(req.path, None)
     return {"jpeg_path": str(jpeg_path), "converted": True}
+
+
+def _run_export_job(job_id: str, to_export: list, req: BulkExportReq,
+                    folder: str, export_dir: Path, db_data: dict) -> None:
+    job = export_jobs[job_id]
+    strength = max(1, min(5, req.strength))
+    q = max(80, min(100, req.quality))
+
+    for path in to_export:
+        if job["cancel"]:
+            break
+        job["current"] = Path(path).name
+        try:
+            validate_path(path, folder)
+            if not os.path.isfile(path):
+                continue
+
+            if is_raw(path):
+                raw_bytes = export_raw_to_jpeg(path)
+                img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+                img = ImageOps.exif_transpose(img)
+            else:
+                img = open_as_pil(path)
+                img = ImageOps.exif_transpose(img)
+
+            if req.apply_fixes:
+                cached = analysis_cache.get(path, {})
+                db_row = db_data.get(path)
+                raw_blur = cached.get("blur_score") if cached else (
+                    db_row["blur_score"] if db_row and db_row["blur_score"] is not None else None
+                )
+                blur_score = float(raw_blur) if raw_blur is not None else -1.0
+                if cached:
+                    skew_angle = float(cached.get("skew_angle", 0.0) or 0.0)
+                    keystone_frac = float(cached.get("keystone_frac", 0.0) or 0.0)
+                else:
+                    skew_angle, _ = detect_skew(img)
+                    keystone_frac, _ = detect_keystone(img)
+                img = apply_fixes(img, blur_score, strength, skew_angle, keystone_frac, for_export=True)
+
+            stem = Path(path).stem
+            out_path = export_dir / f"{stem}.jpg"
+            counter = 1
+            while out_path.exists():
+                out_path = export_dir / f"{stem}_{counter}.jpg"
+                counter += 1
+
+            img.save(str(out_path), format="JPEG", quality=q, optimize=True,
+                     subsampling=0 if q >= 95 else -1)
+            job["exported"].append(out_path.name)
+        except Exception as e:
+            job["errors"].append({"name": Path(path).name, "error": str(e)})
+        finally:
+            job["done"] += 1
+
+    job["current"] = ""
+    job["finished"] = True
+
+
+@app.post("/api/export_bulk")
+def export_bulk(req: BulkExportReq):
+    folder = require_valid_folder(req.folder)
+    all_paths = scan_photos(folder)
+
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT path, blur_score, classification FROM photos WHERE folder=?",
+            (folder,),
+        ).fetchall()
+
+    db_data = {r["path"]: r for r in rows}
+
+    to_export = []
+    for path in all_paths:
+        row = db_data.get(path)
+        cls = row["classification"] if row else None
+        if cls in ("favorite", "keep"):
+            to_export.append(path)
+        elif cls == "unsure" and req.include_unsure:
+            to_export.append(path)
+        elif cls is None and req.include_unreviewed:
+            to_export.append(path)
+
+    export_dir = Path(folder) / "_export"
+    export_dir.mkdir(exist_ok=True)
+
+    job_id = str(uuid.uuid4())
+    export_jobs[job_id] = {
+        "total": len(to_export),
+        "done": 0,
+        "current": "",
+        "exported": [],
+        "errors": [],
+        "export_dir": str(export_dir),
+        "cancel": False,
+        "finished": len(to_export) == 0,  # trivially done if nothing to export
+    }
+
+    if to_export:
+        threading.Thread(
+            target=_run_export_job,
+            args=(job_id, to_export, req, folder, export_dir, db_data),
+            daemon=True,
+        ).start()
+
+    return {"job_id": job_id, "total": len(to_export), "export_dir": str(export_dir)}
+
+
+@app.get("/api/export_bulk/progress/{job_id}")
+def export_bulk_progress(job_id: str):
+    if job_id not in export_jobs:
+        raise HTTPException(404, "Job not found")
+
+    def generate():
+        try:
+            while True:
+                job = export_jobs.get(job_id)
+                if not job:
+                    return
+                is_done = job["finished"]
+                event: dict = {
+                    "done": job["done"],
+                    "total": job["total"],
+                    "current": job["current"],
+                    "cancelled": job["cancel"],
+                    "finished": is_done,
+                }
+                if is_done:
+                    event["exported"] = list(job["exported"])
+                    event["errors"] = list(job["errors"])
+                    event["export_dir"] = job["export_dir"]
+                    event["count"] = len(job["exported"])
+                yield f"data: {json.dumps(event)}\n\n"
+                if is_done:
+                    export_jobs.pop(job_id, None)
+                    return
+                time.sleep(0.25)
+        except GeneratorExit:
+            pass
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/export_bulk/abort/{job_id}")
+def abort_export(job_id: str):
+    job = export_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    job["cancel"] = True
+    return {"ok": True}
 
 
 @app.get("/api/reveal")
